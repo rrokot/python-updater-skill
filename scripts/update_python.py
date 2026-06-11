@@ -10,7 +10,7 @@ the system interpreter.
 Flow:
   0. Update the Python Install Manager itself          (winget upgrade)
   1. Find the latest stable official CPython           (pymanager list --online)
-  2. Install it if missing                             (pymanager install <minor> -y)
+  2. Install it if missing                             (pymanager install <X.Y.Z> -y)
   3. Make it the OS default                            (pymanager.json default_tag)
   4. Recreate the project's venv if it is older        (uv / poetry)
 
@@ -431,7 +431,7 @@ def main(argv=None) -> int:
         else:
             if have:
                 info(f"Python {minor} is {vstr(have)}; installing {vstr(target)}")
-            run(pym("install", minor, "-y"), dry=args.dry_run)
+            run(pym("install", vstr(target), "-y"), dry=args.dry_run)
 
         # 3. Make it the OS default.
         set_os_default(minor, args.dry_run)
