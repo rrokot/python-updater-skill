@@ -221,10 +221,9 @@ def sync_poetry(project: Path, exe: str, dry: bool) -> None:
         if not dry:
             run([str(poetry_home / "Scripts" / "pip.exe"), "install", "--upgrade", "poetry"], dry=dry)
 
-    # Remove all poetry-managed envs for this project.
-    # poetry env remove --all fails when the env's Python is missing, so we also
-    # directly purge matching entries from the poetry virtualenvs cache.
-    run(["poetry", "env", "remove", "--all"], cwd=project, check=False, dry=dry)
+    # Remove all envs directly — skipping `poetry env remove --all` because it
+    # spawns python.exe from the env to introspect it, creating a file lock that
+    # then blocks our own PowerShell removal.
     _remove_stale_poetry_cache_envs(project, dry)
     # Also remove in-project .venv directly in case it's broken/unregistered
     inproject_venv = project / ".venv"
