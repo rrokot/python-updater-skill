@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 PYMANAGER = "pymanager"
@@ -123,7 +124,10 @@ def set_default_python(version: str) -> None:
 # ── venv ─────────────────────────────────────────────────────────────────────
 
 def detect_venv_tool(project: Path) -> str | None:
-    text = (project / "pyproject.toml").read_text(encoding="utf-8") if (project / "pyproject.toml").exists() else ""
+    try:
+        text = (project / "pyproject.toml").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
     uv = (project / "uv.lock").exists() or "[tool.uv]" in text
     poetry = (project / "poetry.lock").exists() or "[tool.poetry]" in text
     if uv == poetry:
@@ -143,13 +147,25 @@ def read_venv_version(venv: Path) -> str | None:
     return None
 
 
-def remove_dir(path: Path) -> None:
-    if not path.exists():
-        return
+def _ps(command: str) -> None:
     subprocess.run(
-        ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
+        ["powershell", "-NoProfile", "-Command", command],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+
+
+def remove_dir(path: Path) -> None:
+    if path.exists():
+        _ps(f"Remove-Item -Recurse -Force '{path}'")
+
+
+def rename_aside(path: Path) -> Path:
+    """Rename path → path_old; works even when the IDE holds file handles open."""
+    aside = path.parent / (path.name + "_old")
+    remove_dir(aside)
+    if path.exists():
+        _ps(f"Rename-Item -Path '{path}' -NewName '{aside.name}'")
+    return aside
 
 
 def sync_uv(project: Path, exe: str) -> None:
@@ -160,22 +176,15 @@ def sync_uv(project: Path, exe: str) -> None:
     # uv failed — IDE likely holds a lock on .venv/Scripts/python.exe.
     # Renaming the directory works even with open handles (Windows allows it);
     # uv then creates a fresh .venv and we clean up the old one afterwards.
-    venv = project / ".venv"
-    venv_old = project / ".venv_old"
-    log("uv sync failed (IDE lock) — renaming .venv to .venv_old and retrying")
-    remove_dir(venv_old)
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", f"Rename-Item -Path '{venv}' -NewName '.venv_old'"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    log("uv sync failed (IDE lock) — renaming .venv aside and retrying")
+    venv_old = rename_aside(project / ".venv")
     run(uv_sync, cwd=project)
     remove_dir(venv_old)
     if venv_old.exists():
-        warn(".venv_old not deleted — IDE still holds handles; remove it after restarting the IDE")
+        warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
 
 
 def _remove_stale_poetry_cache_envs(project: Path) -> None:
-    import tomllib
     pyproject = project / "pyproject.toml"
     if not pyproject.exists():
         return
@@ -207,14 +216,7 @@ def sync_poetry(project: Path, exe: str) -> None:
         run([str(poetry_home / "Scripts" / "pip.exe"), "install", "--upgrade", "poetry"])
 
     _remove_stale_poetry_cache_envs(project)
-    venv = project / ".venv"
-    venv_old = project / ".venv_old"
-    remove_dir(venv_old)
-    if venv.exists():
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"Rename-Item -Path '{venv}' -NewName '.venv_old'"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+    venv_old = rename_aside(project / ".venv")
 
     run(["poetry", "config", "virtualenvs.in-project", "true"], cwd=project)
     code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False)
@@ -223,7 +225,7 @@ def sync_poetry(project: Path, exe: str) -> None:
 
     remove_dir(venv_old)
     if venv_old.exists():
-        warn(".venv_old not deleted — IDE still holds handles; remove it after restarting the IDE")
+        warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
 
     code, _ = run(["poetry", "install"], cwd=project, check=False)
     if code != 0:
