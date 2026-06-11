@@ -5,7 +5,6 @@ then recreate the project's virtualenv on the new interpreter.
 Usage:
     py update_python.py
     py update_python.py -p ../other-project
-    py update_python.py --dry-run
 """
 from __future__ import annotations
 
@@ -41,11 +40,8 @@ def warn(msg: str) -> None:
     print(f"[update-python] WARNING: {msg}", file=sys.stderr)
 
 
-def run(cmd: list, *, capture=False, check=True, cwd=None, dry=False) -> tuple[int, str]:
+def run(cmd: list, *, capture=False, check=True, cwd=None) -> tuple[int, str]:
     label = " ".join(str(c) for c in cmd)
-    if dry and not capture:
-        log(f"DRY-RUN $ {label}")
-        return 0, ""
     log(f"$ {label}")
     r = subprocess.run(
         cmd, cwd=str(cwd) if cwd else None, text=True,
@@ -66,23 +62,21 @@ def version_key(ver: str) -> tuple[int, ...]:
 
 # ── pymanager ────────────────────────────────────────────────────────────────
 
-def setup_pymanager(dry: bool) -> None:
-    """Install pymanager if missing, update it, and remove the legacy Python Launcher."""
+def setup_pymanager() -> None:
     if not shutil.which(PYMANAGER):
         log("pymanager not found — installing via winget")
-        run(winget("install", "--id", PYMANAGER_WINGET_ID, "-e"), check=False, dry=dry)
-        if not dry and not shutil.which(PYMANAGER):
+        run(winget("install", "--id", PYMANAGER_WINGET_ID, "-e"), check=False)
+        if not shutil.which(PYMANAGER):
             raise Abort("pymanager installed but not on PATH — open a new terminal and re-run")
 
-    run(winget("upgrade", "--id", PYMANAGER_WINGET_ID, "-e"), check=False, dry=dry)
+    run(winget("upgrade", "--id", PYMANAGER_WINGET_ID, "-e"), check=False)
     _, out = run(["winget", "list", "--id", LEGACY_LAUNCHER_WINGET_ID, "-e"], capture=True, check=False)
     if LEGACY_LAUNCHER_WINGET_ID in out:
         log("removing legacy Python Launcher")
-        run(winget("uninstall", "--id", LEGACY_LAUNCHER_WINGET_ID, "-e"), check=False, dry=dry)
+        run(winget("uninstall", "--id", LEGACY_LAUNCHER_WINGET_ID, "-e"), check=False)
 
 
 def latest_stable_version() -> str:
-    """Return the newest stable CPython version string, e.g. '3.14.6'."""
     _, out = run([PYMANAGER, "list", "--online", "-f=json"], capture=True)
     versions = [
         e["sort-version"]
@@ -97,7 +91,6 @@ def latest_stable_version() -> str:
 
 
 def find_installed_exe(version: str) -> str | None:
-    """Return the executable path for a pymanager-installed `version`, or None."""
     _, out = run([PYMANAGER, "list", "-f=json"], capture=True, check=False)
     try:
         entries = json.loads(out).get("versions", [])
@@ -111,7 +104,7 @@ def find_installed_exe(version: str) -> str | None:
     return None
 
 
-def set_default_python(version: str, dry: bool) -> None:
+def set_default_python(version: str) -> None:
     minor = ".".join(version.split(".")[:2])
     cfg = Path(os.environ["APPDATA"]) / "Python" / "pymanager.json"
     try:
@@ -120,9 +113,6 @@ def set_default_python(version: str, dry: bool) -> None:
         data = {}
     if data.get("default_tag") == minor:
         log(f"OS default already Python {minor}")
-        return
-    if dry:
-        log(f"DRY-RUN would set OS default to Python {minor}")
         return
     data["default_tag"] = minor
     cfg.parent.mkdir(parents=True, exist_ok=True)
@@ -142,7 +132,6 @@ def detect_venv_tool(project: Path) -> str | None:
 
 
 def read_venv_version(venv: Path) -> str | None:
-    """Read Python version from pyvenv.cfg, return as '3.14.6' or None."""
     cfg = venv / "pyvenv.cfg"
     if not cfg.exists():
         return None
@@ -154,54 +143,39 @@ def read_venv_version(venv: Path) -> str | None:
     return None
 
 
-def remove_dir(path: Path, dry: bool) -> bool:
-    """Remove a directory via PowerShell, retrying to handle transient IDE file locks.
-
-    First deletes pyvenv.cfg so the IDE detects a broken env and releases
-    its handle on python.exe, then retries the full removal.
-    """
+def remove_dir(path: Path) -> None:
     if not path.exists():
-        return True
-    if dry:
-        log(f"DRY-RUN would remove {path}")
-        return True
-    import time
-    # Delete pyvenv.cfg first so the IDE sees a broken venv and releases python.exe
-    cfg = path / "pyvenv.cfg"
-    if cfg.exists():
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"Remove-Item -Force '{cfg}'"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-    t0 = time.monotonic()
-    for attempt in range(30):
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        if not path.exists():
-            elapsed = time.monotonic() - t0
-            if attempt > 0:
-                log(f"removed {path.name} after {attempt + 1} attempts ({elapsed:.1f}s)")
-            return True
-        time.sleep(1)
-    warn(f"could not remove {path} — close the IDE and delete manually")
-    return False
+        return
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
 
 
-def sync_uv(project: Path, exe: str, dry: bool) -> None:
+def sync_uv(project: Path, exe: str) -> None:
     uv_sync = ["uv", "sync", "--python", exe, "--no-managed-python", "--no-python-downloads"]
-    code, _ = run(uv_sync, cwd=project, check=False, dry=dry)
-    if code != 0:
-        warn("uv sync failed — removing .venv and retrying")
-        if not remove_dir(project / ".venv", dry):
-            raise Abort(".venv is locked — close the IDE and retry")
-        run(uv_sync, cwd=project, dry=dry)
+    code, _ = run(uv_sync, cwd=project, check=False)
+    if code == 0:
+        return
+    # uv failed — IDE likely holds a lock on .venv/Scripts/python.exe.
+    # Renaming the directory works even with open handles (Windows allows it);
+    # uv then creates a fresh .venv and we clean up the old one afterwards.
+    venv = project / ".venv"
+    venv_old = project / ".venv_old"
+    log("uv sync failed (IDE lock) — renaming .venv to .venv_old and retrying")
+    remove_dir(venv_old)
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", f"Rename-Item -Path '{venv}' -NewName '.venv_old'"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    run(uv_sync, cwd=project)
+    remove_dir(venv_old)
+    if venv_old.exists():
+        warn(".venv_old not deleted — IDE still holds handles; remove it after restarting the IDE")
 
 
-def _remove_stale_poetry_cache_envs(project: Path, dry: bool) -> None:
-    """Directly delete poetry cache virtualenvs for this project by name prefix."""
-    import tomllib  # Python 3.11+
+def _remove_stale_poetry_cache_envs(project: Path) -> None:
+    import tomllib
     pyproject = project / "pyproject.toml"
     if not pyproject.exists():
         return
@@ -214,7 +188,6 @@ def _remove_stale_poetry_cache_envs(project: Path, dry: bool) -> None:
     )
     if not project_name:
         return
-    # Poetry normalises the project name: lowercase, replace non-alphanumeric with -
     normalised = re.sub(r"[^a-z0-9]+", "-", project_name.lower()).strip("-")
     cache_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "pypoetry" / "Cache" / "virtualenvs"
     if not cache_dir.exists():
@@ -222,47 +195,42 @@ def _remove_stale_poetry_cache_envs(project: Path, dry: bool) -> None:
     for entry in cache_dir.iterdir():
         if entry.is_dir() and entry.name.startswith(normalised + "-"):
             log(f"removing stale poetry cache env: {entry}")
-            remove_dir(entry, dry)
+            remove_dir(entry)
 
 
-def sync_poetry(project: Path, exe: str, dry: bool) -> None:
-    # Poetry itself runs inside its own venv — rebuild it on the new interpreter first
+def sync_poetry(project: Path, exe: str) -> None:
     poetry_home = Path(os.environ["APPDATA"]) / "pypoetry" / "venv"
     if poetry_home.exists():
         log("rebuilding Poetry's own venv")
-        remove_dir(poetry_home, dry)
-        run([exe, "-m", "venv", str(poetry_home)], dry=dry)
-        if not dry:
-            run([str(poetry_home / "Scripts" / "pip.exe"), "install", "--upgrade", "poetry"], dry=dry)
+        remove_dir(poetry_home)
+        run([exe, "-m", "venv", str(poetry_home)])
+        run([str(poetry_home / "Scripts" / "pip.exe"), "install", "--upgrade", "poetry"])
 
-    # Remove all envs directly — skipping `poetry env remove --all` because it
-    # spawns python.exe from the env to introspect it, creating a file lock that
-    # then blocks our own PowerShell removal.
-    _remove_stale_poetry_cache_envs(project, dry)
-    inproject_venv = project / ".venv"
-    venv_removed = not inproject_venv.exists() or remove_dir(inproject_venv, dry)
+    _remove_stale_poetry_cache_envs(project)
+    venv = project / ".venv"
+    venv_old = project / ".venv_old"
+    remove_dir(venv_old)
+    if venv.exists():
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Rename-Item -Path '{venv}' -NewName '.venv_old'"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
 
-    run(["poetry", "config", "virtualenvs.in-project", "true"], cwd=project, dry=dry)
+    run(["poetry", "config", "virtualenvs.in-project", "true"], cwd=project)
+    code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False)
+    if code != 0:
+        raise Abort(f"poetry env use {exe} failed")
 
-    if not venv_removed:
-        # IDE holds python.exe — pyvenv.cfg is already gone (removed by remove_dir)
-        # so `poetry env use` would fail trying to introspect the broken env.
-        # Create the venv directly with virtualenv --clear, which overwrites everything
-        # except the locked python.exe, writing a fresh pyvenv.cfg.
-        log("creating venv directly via virtualenv (IDE holds python.exe lock)")
-        poetry_python = Path(os.environ["APPDATA"]) / "pypoetry" / "venv" / "Scripts" / "python.exe"
-        run([str(poetry_python), "-m", "virtualenv", "--clear", "--python", exe, str(inproject_venv)], cwd=project, check=False, dry=dry)
-    else:
-        code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False, dry=dry)
-        if code != 0:
-            raise Abort(f"poetry env use {exe} failed")
+    remove_dir(venv_old)
+    if venv_old.exists():
+        warn(".venv_old not deleted — IDE still holds handles; remove it after restarting the IDE")
 
-    code, _ = run(["poetry", "install"], cwd=project, check=False, dry=dry)
+    code, _ = run(["poetry", "install"], cwd=project, check=False)
     if code != 0:
         warn("poetry install reported errors — review output above")
 
 
-def rebuild_venv(project: Path, target: str, exe: str, dry: bool) -> None:
+def rebuild_venv(project: Path, target: str, exe: str) -> None:
     tool = detect_venv_tool(project)
     if not tool:
         log("no uv/poetry project detected — skipping venv update")
@@ -276,9 +244,9 @@ def rebuild_venv(project: Path, target: str, exe: str, dry: bool) -> None:
     log(f"updating venv: {current or 'none'} → {target}")
 
     if tool == "uv":
-        sync_uv(project, exe, dry)
+        sync_uv(project, exe)
     else:
-        sync_poetry(project, exe, dry)
+        sync_poetry(project, exe)
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
@@ -288,14 +256,12 @@ def main(argv=None) -> int:
         description="Update Python to the latest stable release and rebuild the project venv."
     )
     parser.add_argument("-p", "--project", default=".", help="project directory (default: cwd)")
-    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     project = Path(args.project).resolve()
-    dry = args.dry_run
 
     try:
-        setup_pymanager(dry)
+        setup_pymanager()
 
         target = latest_stable_version()
         log(f"latest stable: Python {target}")
@@ -305,17 +271,17 @@ def main(argv=None) -> int:
             log(f"already installed: {exe}")
         else:
             log(f"installing Python {target}")
-            run([PYMANAGER, "install", target, "-y"], dry=dry)
+            run([PYMANAGER, "install", target, "-y"])
             exe = find_installed_exe(target)
 
-        set_default_python(target, dry)
-        rebuild_venv(project, target, exe or f"python{target}", dry)
+        set_default_python(target)
+        rebuild_venv(project, target, exe or f"python{target}")
 
     except Abort as e:
         warn(str(e))
         return 1
 
-    log("done" + (" (dry-run)" if dry else ""))
+    log("done")
     return 0
 
 
