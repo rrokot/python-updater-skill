@@ -161,14 +161,18 @@ def remove_dir(path: Path, dry: bool) -> bool:
     if dry:
         log(f"DRY-RUN would remove {path}")
         return True
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if path.exists():
-        warn(f"could not remove {path} — close the IDE and delete manually")
-        return False
-    return True
+    for attempt in range(2):
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if not path.exists():
+            return True
+        if attempt == 0:
+            import time
+            time.sleep(1)
+    warn(f"could not remove {path} — close the IDE and delete manually")
+    return False
 
 
 def sync_uv(project: Path, exe: str, dry: bool) -> None:
