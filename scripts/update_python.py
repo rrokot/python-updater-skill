@@ -155,22 +155,36 @@ def read_venv_version(venv: Path) -> str | None:
 
 
 def remove_dir(path: Path, dry: bool) -> bool:
-    """Remove a directory via PowerShell to handle IDE file locks."""
+    """Remove a directory via PowerShell, retrying to handle transient IDE file locks.
+
+    First deletes pyvenv.cfg so the IDE detects a broken env and releases
+    its handle on python.exe, then retries the full removal.
+    """
     if not path.exists():
         return True
     if dry:
         log(f"DRY-RUN would remove {path}")
         return True
-    for attempt in range(2):
+    import time
+    # Delete pyvenv.cfg first so the IDE sees a broken venv and releases python.exe
+    cfg = path / "pyvenv.cfg"
+    if cfg.exists():
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Remove-Item -Force '{cfg}'"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    t0 = time.monotonic()
+    for attempt in range(30):
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", f"Remove-Item -Recurse -Force '{path}'"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         if not path.exists():
+            elapsed = time.monotonic() - t0
+            if attempt > 0:
+                log(f"removed {path.name} after {attempt + 1} attempts ({elapsed:.1f}s)")
             return True
-        if attempt == 0:
-            import time
-            time.sleep(1)
+        time.sleep(1)
     warn(f"could not remove {path} — close the IDE and delete manually")
     return False
 
@@ -225,14 +239,24 @@ def sync_poetry(project: Path, exe: str, dry: bool) -> None:
     # spawns python.exe from the env to introspect it, creating a file lock that
     # then blocks our own PowerShell removal.
     _remove_stale_poetry_cache_envs(project, dry)
-    # Also remove in-project .venv directly in case it's broken/unregistered
     inproject_venv = project / ".venv"
-    if inproject_venv.exists():
-        remove_dir(inproject_venv, dry)
+    venv_removed = not inproject_venv.exists() or remove_dir(inproject_venv, dry)
+
     run(["poetry", "config", "virtualenvs.in-project", "true"], cwd=project, dry=dry)
-    code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False, dry=dry)
-    if code != 0:
-        raise Abort(f"poetry env use {exe} failed")
+
+    if not venv_removed:
+        # IDE holds python.exe — pyvenv.cfg is already gone (removed by remove_dir)
+        # so `poetry env use` would fail trying to introspect the broken env.
+        # Create the venv directly with virtualenv --clear, which overwrites everything
+        # except the locked python.exe, writing a fresh pyvenv.cfg.
+        log("creating venv directly via virtualenv (IDE holds python.exe lock)")
+        poetry_python = Path(os.environ["APPDATA"]) / "pypoetry" / "venv" / "Scripts" / "python.exe"
+        run([str(poetry_python), "-m", "virtualenv", "--clear", "--python", exe, str(inproject_venv)], cwd=project, check=False, dry=dry)
+    else:
+        code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False, dry=dry)
+        if code != 0:
+            raise Abort(f"poetry env use {exe} failed")
+
     code, _ = run(["poetry", "install"], cwd=project, check=False, dry=dry)
     if code != 0:
         warn("poetry install reported errors — review output above")
