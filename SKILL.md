@@ -65,20 +65,15 @@ skill's directory.
 # Latest stable: update the manager, set the OS default, rebuild this project's venv
 py <skill>/scripts/update_python.py
 
-# Pin a minor series
-py <skill>/scripts/update_python.py 3.13
-
-# Target a different project, preview only
-py <skill>/scripts/update_python.py -p ../service --dry-run
+# Target a different project
+py <skill>/scripts/update_python.py -p ../service
 ```
 
 ### Options
 
-| Flag                    | Meaning                                                      |
-| ----------------------- | ----------------------------------------------------------- |
-| `version` (positional)  | Target minor, e.g. `3.13`. Default: latest stable.          |
-| `-p`, `--project`       | Project directory. Default: current directory.              |
-| `--dry-run`             | Print the planned actions without changing anything.        |
+| Flag             | Meaning                                       |
+| ---------------- | --------------------------------------------- |
+| `-p`, `--project` | Project directory. Default: current directory. |
 
 Everything else is automatic: the venv manager is auto-detected, only stable
 releases are considered, the new version is made the OS default, the install
@@ -86,7 +81,7 @@ manager is updated, and the legacy launcher is removed if found.
 
 ## Guidance for the agent
 
-- **Run `--dry-run` first** and show the user the plan before applying.
+- This script applies changes immediately — there is no dry-run mode. Before running, confirm with the user that they want to change the OS default Python.
 - Note that a real run **changes the OS default Python** and removes the legacy
   launcher; make sure that is what the user wants before applying.
 - After a real run, the new default takes effect in fresh shells; suggest
