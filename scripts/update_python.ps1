@@ -85,47 +85,21 @@ function Test-UnderRoot([string]$Path, [string]$Root) {
 }
 
 function Get-BlockingProcess([string]$Root) {
-    # Two passes, because neither alone is enough.
+    # Only python.exe/pythonw.exe. Console scripts of a venv (pip.exe and friends) do not
+    # hold the install themselves — those launchers CreateProcess a child python.exe, and
+    # the child is what turns up here.
     #
-    # By loaded module: catches processes that hold the install open under a name of
-    # their own — anything embedding the interpreter by loading pythonXY.dll directly.
-    # (Console scripts such as pip.exe are not this case: those launchers CreateProcess
-    # a child python.exe, which the name pass below is what actually catches.)
-    # Reading .Modules throws on processes we cannot open — elevated, or the other
-    # bitness — so each process is attempted independently.
-    #
-    # By name: python.exe/pythonw.exe, including the ones whose modules we just failed
-    # to read. A venv's own python.exe names its base install in pyvenv.cfg's `home`.
-    $info = @{}
-    foreach ($p in Get-CimInstance Win32_Process) { $info[[int]$p.ProcessId] = $p }
-
-    # Keyed by PID as a string: an [ordered] dictionary reads an integer index as a
-    # position, not as a key, so integer keys throw once a PID exceeds the count.
-    $blockers = [ordered]@{}
-
-    foreach ($proc in Get-Process) {
-        $hit = $false
-        try {
-            foreach ($m in $proc.Modules) {
-                if (Test-UnderRoot $m.FileName $Root) { $hit = $true; break }
-            }
-        }
-        catch { continue }  # cannot read this process's modules — elevated, or other bitness
-        if (-not $hit) { continue }
-        $ci = $info[[int]$proc.Id]
-        $blockers["$($proc.Id)"] = [pscustomobject]@{
-            ProcessId   = $proc.Id
-            Path        = if ($ci) { $ci.ExecutablePath } else { $proc.ProcessName }
-            CommandLine = if ($ci) { $ci.CommandLine } else { $null }
-        }
-    }
-
-    foreach ($p in $info.Values) {
-        if ($p.Name -notin @('python.exe', 'pythonw.exe')) { continue }
-        if ($blockers.Contains("$($p.ProcessId)")) { continue }
+    # A process embedding python3XY.dll under a name of its own is missed. Scanning the
+    # loaded modules of every process to catch that was tried and removed: ~3.7s against
+    # ~50ms for this, it silently under-reported (Process.Modules comes back truncated for
+    # some processes, with no error raised), and it never found anything this pass did not.
+    $blockers = @()
+    foreach ($p in Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'") {
         $exe = $p.ExecutablePath
         if (-not $exe) { continue }
         if (-not (Test-UnderRoot $exe $Root)) {
+            # A venv runs its own python.exe but loads the base install's DLL, and
+            # pyvenv.cfg's `home` is what says which install that is.
             $cfg = Join-Path (Split-Path (Split-Path $exe -Parent) -Parent) 'pyvenv.cfg'
             if (-not (Test-Path $cfg)) { continue }
             $line = Get-Content $cfg | Where-Object { $_ -match '^\s*home\s*=' } | Select-Object -First 1
@@ -134,14 +108,13 @@ function Get-BlockingProcess([string]$Root) {
             # `home` is the install root itself, so match it as well as anything under it.
             if ($venvHome.TrimEnd('\', '/') -ne $Root.TrimEnd('\', '/') -and -not (Test-UnderRoot $venvHome $Root)) { continue }
         }
-        $blockers["$($p.ProcessId)"] = [pscustomobject]@{
+        $blockers += [pscustomobject]@{
             ProcessId   = $p.ProcessId
             Path        = $exe
             CommandLine = $p.CommandLine
         }
     }
-
-    return @($blockers.Values)
+    return $blockers
 }
 
 function Initialize-PyManager {

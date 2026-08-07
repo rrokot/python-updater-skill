@@ -122,6 +122,28 @@ def rename_aside(path: Path) -> Path:
     return aside
 
 
+def update_tool(tool: str) -> None:
+    """Freshen the venv manager itself. Runs whether or not the venv needs rebuilding,
+    and is never fatal — a stale uv or poetry is no reason to abandon a Python update."""
+    if tool == "uv":
+        # A standalone-installed uv updates itself; one installed through pip or winget
+        # refuses, and that refusal is not an error worth stopping for.
+        if run(["uv", "self", "update"], check=False) != 0:
+            warn("uv self update failed — continuing with the installed uv")
+        return
+
+    # Poetry is upgraded in place. Tearing its venv down and rebuilding it on the new
+    # interpreter was tried and dropped: the venv does not break in the first place — it
+    # names its install by path, a patch bump replaces that directory with an ABI-compatible
+    # one, and a minor bump leaves it alone — while the teardown left the machine with no
+    # poetry at all whenever the reinstall could not reach PyPI.
+    poetry_pip = Path(os.environ["APPDATA"]) / "pypoetry" / "venv" / "Scripts" / "pip.exe"
+    if poetry_pip.exists():
+        log("upgrading Poetry")
+        if run([str(poetry_pip), "install", "--upgrade", "poetry"], check=False) != 0:
+            warn("Poetry upgrade failed — continuing with the installed version")
+
+
 def sync_uv(project: Path, exe: str) -> None:
     uv_sync = ["uv", "sync", "--python", exe, "--no-managed-python", "--no-python-downloads"]
     if run(uv_sync, cwd=project, check=False) == 0:
@@ -157,13 +179,6 @@ def _remove_stale_poetry_cache_envs(project: Path) -> None:
 
 
 def sync_poetry(project: Path, exe: str) -> None:
-    poetry_home = Path(os.environ["APPDATA"]) / "pypoetry" / "venv"
-    if poetry_home.exists():
-        log("rebuilding Poetry's own venv")
-        remove_dir(poetry_home)
-        run([exe, "-m", "venv", str(poetry_home)])
-        run([str(poetry_home / "Scripts" / "pip.exe"), "install", "--upgrade", "poetry"])
-
     _remove_stale_poetry_cache_envs(project)
     venv_old = rename_aside(project / ".venv")
 
@@ -185,6 +200,7 @@ def rebuild_venv(project: Path, target: str, exe: str) -> None:
         log("no uv/poetry project detected — skipping venv update")
         return
     log(f"venv tool: {tool}")
+    update_tool(tool)
 
     current = read_venv_version(project / ".venv")
     if current and version_key(current) >= version_key(target):

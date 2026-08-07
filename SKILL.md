@@ -20,13 +20,14 @@ half and installs nothing. Below, `<skill>` is this skill's directory.
 ```
 
 `-p` / `-Project` is the only option. The rest is automatic: venv manager
-auto-detected (uv or poetry), stable releases only, OS default updated, install
-manager updated, legacy launcher removed.
+auto-detected (uv or poetry) and upgraded, stable releases only, OS default
+updated, install manager updated, legacy launcher removed.
 
 ## Guidance for the agent
 
 - Changes apply immediately and there is no dry-run mode. **Confirm with the user
-  before running** — a real run changes the OS default Python.
+  before running** — a real run changes the OS default Python and also upgrades
+  the project's uv or poetry to the latest version.
 - If it exits 1 with a list of PIDs, those processes hold the install being
   replaced. Relay the list and ask the user to close them; do not kill them
   yourself. Then re-run — the script is idempotent.
