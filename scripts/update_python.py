@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Update the system Python to the latest stable release via the Python Install Manager,
-then recreate the project's virtualenv on the new interpreter.
+"""Phase 2 of the python-updater skill: make the running interpreter the OS default
+and rebuild the project's virtualenv on it.
+
+Not an entry point. update_python.ps1 installs the interpreter — from PowerShell,
+because pymanager replaces an install by deleting its directory and Windows refuses
+while its files are open — and then launches this script with the interpreter it just
+installed. Nothing here installs anything, so nothing here requires a Python to be closed.
+
+The target version and executable come from the interpreter running this script rather
+than from flags or from pymanager: launched with the right python.exe, phase 2 cannot
+disagree with phase 1.
 
 Usage:
-    py update_python.py
-    py update_python.py -p ../other-project
+    powershell -File update_python.ps1
 """
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -17,16 +23,6 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-
-PYMANAGER = "pymanager"
-PYMANAGER_WINGET_ID = "Python.PythonInstallManager"
-LEGACY_LAUNCHER_WINGET_ID = "Python.Launcher"
-
-WINGET_FLAGS = ["--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
-
-
-def winget(*args) -> list[str]:
-    return ["winget", *args, *WINGET_FLAGS]
 
 
 class Abort(Exception):
@@ -41,69 +37,20 @@ def warn(msg: str) -> None:
     print(f"[update-python] WARNING: {msg}", file=sys.stderr)
 
 
-def run(cmd: list, *, capture=False, check=True, cwd=None) -> tuple[int, str]:
+def run(cmd: list, *, check=True, cwd=None) -> int:
     label = " ".join(str(c) for c in cmd)
     log(f"$ {label}")
-    r = subprocess.run(
-        cmd, cwd=str(cwd) if cwd else None, text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-    )
+    r = subprocess.run(cmd, cwd=cwd)
     if check and r.returncode != 0:
-        if capture:
-            sys.stderr.write(r.stdout or "")
-            sys.stderr.write(r.stderr or "")
         raise Abort(f"command failed ({r.returncode}): {label}")
-    return r.returncode, r.stdout or ""
+    return r.returncode
 
 
 def version_key(ver: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", ver)[:3])
 
 
-# ── pymanager ────────────────────────────────────────────────────────────────
-
-def setup_pymanager() -> None:
-    if not shutil.which(PYMANAGER):
-        log("pymanager not found — installing via winget")
-        run(winget("install", "--id", PYMANAGER_WINGET_ID, "-e"), check=False)
-        if not shutil.which(PYMANAGER):
-            raise Abort("pymanager installed but not on PATH — open a new terminal and re-run")
-
-    run(winget("upgrade", "--id", PYMANAGER_WINGET_ID, "-e"), check=False)
-    _, out = run(["winget", "list", "--id", LEGACY_LAUNCHER_WINGET_ID, "-e"], capture=True, check=False)
-    if LEGACY_LAUNCHER_WINGET_ID in out:
-        log("removing legacy Python Launcher")
-        run(winget("uninstall", "--id", LEGACY_LAUNCHER_WINGET_ID, "-e"), check=False)
-
-
-def latest_stable_version() -> str:
-    _, out = run([PYMANAGER, "list", "--online", "-f=json"], capture=True)
-    versions = [
-        e["sort-version"]
-        for e in json.loads(out).get("versions", [])
-        if e.get("company") == "PythonCore"
-        and not re.match(r"^\d+\.\d+t", str(e.get("tag", "")))
-        and re.match(r"^\d+\.\d+\.\d+$", e.get("sort-version", ""))
-    ]
-    if not versions:
-        raise Abort("no stable CPython found in pymanager online catalog")
-    return max(versions, key=version_key)
-
-
-def find_installed_exe(version: str) -> str | None:
-    _, out = run([PYMANAGER, "list", "-f=json"], capture=True, check=False)
-    try:
-        entries = json.loads(out).get("versions", [])
-    except json.JSONDecodeError:
-        return None
-    for e in entries:
-        if (e.get("company") == "PythonCore"
-                and not e.get("unmanaged")
-                and e.get("sort-version") == version):
-            return e.get("executable")
-    return None
-
+# ── OS default ───────────────────────────────────────────────────────────────
 
 def set_default_python(version: str) -> None:
     minor = ".".join(version.split(".")[:2])
@@ -123,13 +70,18 @@ def set_default_python(version: str) -> None:
 
 # ── venv ─────────────────────────────────────────────────────────────────────
 
-def detect_venv_tool(project: Path) -> str | None:
+def read_pyproject(project: Path) -> dict:
     try:
-        text = (project / "pyproject.toml").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        text = ""
-    uv = (project / "uv.lock").exists() or "[tool.uv]" in text
-    poetry = (project / "poetry.lock").exists() or "[tool.poetry]" in text
+        with open(project / "pyproject.toml", "rb") as f:
+            return tomllib.load(f)
+    except (FileNotFoundError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def detect_venv_tool(project: Path) -> str | None:
+    tool = read_pyproject(project).get("tool", {})
+    uv = (project / "uv.lock").exists() or "uv" in tool
+    poetry = (project / "poetry.lock").exists() or "poetry" in tool
     if uv == poetry:
         return None
     return "uv" if uv else "poetry"
@@ -147,36 +99,37 @@ def read_venv_version(venv: Path) -> str | None:
     return None
 
 
-def _ps(command: str) -> None:
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", command],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-
-
 def remove_dir(path: Path) -> None:
-    if path.exists():
-        _ps(f"Remove-Item -Recurse -Force '{path}'")
+    """Best-effort delete. Every caller re-checks and reports what survived, because
+    a directory the IDE still has handles in cannot be removed until it lets go."""
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def rename_aside(path: Path) -> Path:
-    """Rename path → path_old; works even when the IDE holds file handles open."""
+    """Move path → path_old so a tool that refuses to overwrite can build a fresh one.
+
+    This does not defeat a lock: Windows will not rename a directory that still has an
+    open file inside it, whatever sharing mode the holder used. Failing here with the
+    OS error beats letting the caller retry against a directory that never moved.
+    """
     aside = path.parent / (path.name + "_old")
     remove_dir(aside)
     if path.exists():
-        _ps(f"Rename-Item -Path '{path}' -NewName '{aside.name}'")
+        try:
+            path.rename(aside)
+        except OSError as e:
+            raise Abort(f"cannot move {path} aside: {e}")
     return aside
 
 
 def sync_uv(project: Path, exe: str) -> None:
     uv_sync = ["uv", "sync", "--python", exe, "--no-managed-python", "--no-python-downloads"]
-    code, _ = run(uv_sync, cwd=project, check=False)
-    if code == 0:
+    if run(uv_sync, cwd=project, check=False) == 0:
         return
-    # uv failed — IDE likely holds a lock on .venv/Scripts/python.exe.
-    # Renaming the directory works even with open handles (Windows allows it);
-    # uv then creates a fresh .venv and we clean up the old one afterwards.
-    log("uv sync failed (IDE lock) — renaming .venv aside and retrying")
+    # uv failed. Usually the existing .venv is in the way, so move it aside and let uv
+    # build a fresh one. If something genuinely holds the directory open, the move fails
+    # and says so — that is a process to close, not something a retry can fix.
+    log("uv sync failed — moving .venv aside and retrying")
     venv_old = rename_aside(project / ".venv")
     run(uv_sync, cwd=project)
     remove_dir(venv_old)
@@ -185,11 +138,7 @@ def sync_uv(project: Path, exe: str) -> None:
 
 
 def _remove_stale_poetry_cache_envs(project: Path) -> None:
-    pyproject = project / "pyproject.toml"
-    if not pyproject.exists():
-        return
-    with open(pyproject, "rb") as f:
-        data = tomllib.load(f)
+    data = read_pyproject(project)
     project_name = (
         data.get("tool", {}).get("poetry", {}).get("name")
         or data.get("project", {}).get("name")
@@ -219,16 +168,14 @@ def sync_poetry(project: Path, exe: str) -> None:
     venv_old = rename_aside(project / ".venv")
 
     run(["poetry", "config", "virtualenvs.in-project", "true"], cwd=project)
-    code, _ = run(["poetry", "env", "use", exe], cwd=project, check=False)
-    if code != 0:
+    if run(["poetry", "env", "use", exe], cwd=project, check=False) != 0:
         raise Abort(f"poetry env use {exe} failed")
 
     remove_dir(venv_old)
     if venv_old.exists():
         warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
 
-    code, _ = run(["poetry", "install"], cwd=project, check=False)
-    if code != 0:
+    if run(["poetry", "install"], cwd=project, check=False) != 0:
         warn("poetry install reported errors — review output above")
 
 
@@ -255,29 +202,26 @@ def rebuild_venv(project: Path, target: str, exe: str) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Update Python to the latest stable release and rebuild the project venv."
+        description="Make the running interpreter the OS default and rebuild the project venv "
+                    "(phase 2 of update_python.ps1).",
     )
     parser.add_argument("-p", "--project", default=".", help="project directory (default: cwd)")
     args = parser.parse_args(argv)
 
     project = Path(args.project).resolve()
+    target = "%d.%d.%d" % sys.version_info[:3]
+    exe = sys.executable
 
     try:
-        setup_pymanager()
+        if sys.prefix != sys.base_prefix:
+            raise Abort(
+                f"running from a venv ({sys.prefix}) — rebuilding a venv with its own interpreter "
+                f"cannot work. Launch with a base interpreter, or just run update_python.ps1."
+            )
 
-        target = latest_stable_version()
-        log(f"latest stable: Python {target}")
-
-        exe = find_installed_exe(target)
-        if exe:
-            log(f"already installed: {exe}")
-        else:
-            log(f"installing Python {target}")
-            run([PYMANAGER, "install", target, "-y"])
-            exe = find_installed_exe(target)
-
+        log(f"target: Python {target} ({exe})")
         set_default_python(target)
-        rebuild_venv(project, target, exe or f"python{target}")
+        rebuild_venv(project, target, exe)
 
     except Abort as e:
         warn(str(e))
