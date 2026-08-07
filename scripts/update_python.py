@@ -82,7 +82,10 @@ def detect_venv_tool(project: Path) -> str | None:
     tool = read_pyproject(project).get("tool", {})
     uv = (project / "uv.lock").exists() or "uv" in tool
     poetry = (project / "poetry.lock").exists() or "poetry" in tool
-    if uv == poetry:
+    if uv and poetry:
+        warn("project looks like both a uv and a poetry project — cannot tell which to use")
+        return None
+    if not uv and not poetry:
         return None
     return "uv" if uv else "poetry"
 
@@ -168,12 +171,18 @@ def _remove_stale_poetry_cache_envs(project: Path) -> None:
     )
     if not project_name:
         return
-    normalised = re.sub(r"[^a-z0-9]+", "-", project_name.lower()).strip("-")
+    # Mirror Poetry's own EnvManager.generate_env_name: lowercase, replace only this
+    # character set with "_", truncate to 42, then "-<8 char hash>-py<X.Y>". Guessing at
+    # the scheme instead gets it wrong both ways — a name with "_" or "." never matches
+    # its real env, and a bare prefix match makes "app" swallow "app-server-<hash>-py3.14",
+    # deleting a different project's virtualenv.
+    sanitized = re.sub(r'[ $`!*@"\\\r\n\t]', "_", project_name.lower())[:42]
+    pattern = re.compile(rf"^{re.escape(sanitized)}-[A-Za-z0-9_-]{{8}}-py\d+\.\d+$")
     cache_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "pypoetry" / "Cache" / "virtualenvs"
     if not cache_dir.exists():
         return
     for entry in cache_dir.iterdir():
-        if entry.is_dir() and entry.name.startswith(normalised + "-"):
+        if entry.is_dir() and pattern.match(entry.name):
             log(f"removing stale poetry cache env: {entry}")
             remove_dir(entry)
 
