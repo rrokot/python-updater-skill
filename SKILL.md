@@ -1,6 +1,6 @@
 ---
 name: update-venv-python
-description: Update the Python interpreter on Windows to the latest official release using the Python Install Manager (py), make it the OS default, and recreate the active project's virtualenv (poetry or uv) on it. Use when the user wants to upgrade/bump Python to the latest version, update the system/default Python, or migrate a poetry/uv project's venv to a newer Python. Triggers include "обнови python", "поставь последнюю версию python", "update python to latest", "пересоздай venv на новой версии python", "сделай новый python дефолтным".
+description: Update the Python interpreter on Windows to the latest official release using the Python Install Manager (py), make it the OS default, and recreate the active project's virtualenv (poetry or uv) on it. Use when the user wants to upgrade/bump Python to the latest version, update the system/default Python, or migrate a poetry/uv project's venv to a newer Python. Requests may be in Russian or English.
 ---
 
 # Update Python (Python Install Manager + venv)
@@ -19,15 +19,16 @@ half and installs nothing. Below, `<skill>` is this skill's directory.
 & "<skill>\scripts\update_python.ps1" -p ..\service    # another project
 ```
 
-`-p` / `-Project` is the only option. The rest is automatic: venv manager
+`-p` / `-Project` picks the project; `-WhatIf` is a dry run that reports what would
+be installed, removed and rebuilt and changes nothing. The rest is automatic: venv manager
 auto-detected (uv or poetry) and upgraded, stable releases only, OS default
 updated, install manager updated, legacy launcher removed.
 
 ## Guidance for the agent
 
-- Changes apply immediately and there is no dry-run mode. **Confirm with the user
-  before running** — a real run changes the OS default Python and also upgrades
-  the project's uv or poetry to the latest version.
+- Changes apply immediately. **Confirm with the user before a real run** — it
+  changes the OS default Python and also upgrades the project's uv or poetry to
+  the latest version. `-WhatIf` needs no confirmation; offer it first.
 - If it exits 1 with a list of PIDs, those processes hold the install being
   replaced. Relay the list and ask the user to close them; do not kill them
   yourself. Then re-run — the script is idempotent.

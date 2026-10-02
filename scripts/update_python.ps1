@@ -22,23 +22,33 @@
 .PARAMETER Project
     Project directory whose venv is rebuilt. Defaults to the current directory.
 
+.PARAMETER WhatIf
+    Dry run: report what would be installed, removed and rebuilt, and change nothing.
+    Read-only queries (winget list, pymanager list --online) still run.
+
 .EXAMPLE
     .\update_python.ps1
 
 .EXAMPLE
     .\update_python.ps1 -Project ..\service
+
+.EXAMPLE
+    .\update_python.ps1 -WhatIf
 #>
 #Requires -Version 5.1
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [Alias('p')][string]$Project = (Get-Location).Path
 )
 
 $ErrorActionPreference = 'Stop'
+$DryRun = [bool]$WhatIfPreference
 
 $PyManagerWingetId = 'Python.PythonInstallManager'
 $LegacyLauncherWingetId = 'Python.Launcher'
 $WingetFlags = @('--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+# `winget uninstall` rejects --accept-package-agreements and aborts on it.
+$WingetUninstallFlags = @('--accept-source-agreements', '--disable-interactivity', '--silent')
 
 function Write-Step([string]$Message) {
     Write-Host "[update-python] $Message"
@@ -48,9 +58,13 @@ function Write-Warn([string]$Message) {
     Write-Host "[update-python] WARNING: $Message" -ForegroundColor Yellow
 }
 
-function Invoke-Native([string[]]$Command, [switch]$IgnoreExit) {
+function Invoke-Native([string[]]$Command, [switch]$IgnoreExit, [switch]$EvenInDryRun) {
     # Returns nothing on purpose: a return value would have to be piped away at every
     # call site, and piping a native command sends its output there too.
+    if ($DryRun -and -not $EvenInDryRun) {
+        Write-Step "would run: $($Command -join ' ')"
+        return
+    }
     Write-Step "$ $($Command -join ' ')"
     $exe = $Command[0]
     $rest = if ($Command.Count -gt 1) { $Command[1..($Command.Count - 1)] } else { @() }
@@ -117,8 +131,24 @@ function Get-BlockingProcess([string]$Root) {
     return $blockers
 }
 
+function Clear-ActivatedVenv {
+    # Run from an activated venv, its Scripts\ comes first on PATH: uv or poetry would then
+    # start out of the very .venv phase 2 has to move aside, and Windows refuses to move a
+    # directory one of its own executables is running from. Process scope only.
+    if (-not $env:VIRTUAL_ENV) { return }
+    $scripts = (Join-Path $env:VIRTUAL_ENV 'Scripts').TrimEnd('\')
+    $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $scripts }) -join ';'
+    Write-Step "ignoring activated venv: $env:VIRTUAL_ENV"
+    # Not Remove-Item: under -WhatIf it would only pretend, and the dry run would then
+    # preview something other than what a real run does.
+    $env:VIRTUAL_ENV = $null
+}
+
 function Initialize-PyManager {
     if (-not (Get-Command pymanager -ErrorAction SilentlyContinue)) {
+        if ($DryRun) {
+            throw 'pymanager is not installed — a real run installs it via winget; the dry run cannot go further without it'
+        }
         Write-Step 'pymanager not found — installing via winget'
         Invoke-Native (@('winget', 'install', '--id', $PyManagerWingetId, '-e') + $WingetFlags) -IgnoreExit
         if (-not (Get-Command pymanager -ErrorAction SilentlyContinue)) {
@@ -131,7 +161,10 @@ function Initialize-PyManager {
     $listed = & winget list --id $LegacyLauncherWingetId -e
     if ($listed -match [regex]::Escape($LegacyLauncherWingetId)) {
         Write-Step 'removing legacy Python Launcher'
-        Invoke-Native (@('winget', 'uninstall', '--id', $LegacyLauncherWingetId, '-e') + $WingetFlags) -IgnoreExit
+        Invoke-Native (@('winget', 'uninstall', '--id', $LegacyLauncherWingetId, '-e') + $WingetUninstallFlags) -IgnoreExit
+        if (-not $DryRun -and (& winget list --id $LegacyLauncherWingetId -e) -match [regex]::Escape($LegacyLauncherWingetId)) {
+            Write-Warn "legacy Python Launcher still installed — remove it manually: winget uninstall --id $LegacyLauncherWingetId -e"
+        }
     }
 }
 
@@ -147,7 +180,9 @@ function Get-LatestStableVersion {
 
 try {
     $projectPath = (Resolve-Path -LiteralPath $Project).Path
+    if ($DryRun) { Write-Step 'DRY RUN — nothing will be changed' }
 
+    Clear-ActivatedVenv
     Initialize-PyManager
 
     $target = Get-LatestStableVersion
@@ -174,21 +209,39 @@ try {
                     Write-Host ("  PID {0,-8} {1}" -f $b.ProcessId, $what)
                 }
                 Write-Warn 'the list can be incomplete — elevated processes and other-bitness ones are not always visible.'
-                throw 'stop the processes above, then re-run this script'
+                if (-not $DryRun) { throw 'stop the processes above, then re-run this script' }
+                Write-Warn 'a real run would stop here until they are closed'
             }
         }
 
         Write-Step "installing Python $target"
         Invoke-Native @('pymanager', 'install', $target, '-y')
-        $exe = (@(Get-InstalledCore) | Where-Object { $_.'sort-version' -eq $target } | Select-Object -First 1).executable
-        if (-not $exe) { throw "Python $target installed but not listed by pymanager" }
+        if (-not $DryRun) {
+            $exe = (@(Get-InstalledCore) | Where-Object { $_.'sort-version' -eq $target } | Select-Object -First 1).executable
+            if (-not $exe) { throw "Python $target installed but not listed by pymanager" }
+        }
     }
 
     # Phase 2 runs on the interpreter that was just installed, so nothing it does can be
     # holding the files of an install still to be replaced. It also reads its target from
     # the interpreter it is launched with, which is why $exe here is not just a convenience.
     $phase2 = Join-Path $PSScriptRoot 'update_python.py'
-    Invoke-Native @($exe, $phase2, '-p', $projectPath)
+    if (-not $DryRun) {
+        Invoke-Native @($exe, $phase2, '-p', $projectPath)
+    }
+    else {
+        # Nothing was installed, so preview phase 2 on the newest install there is and tell
+        # it which version it stands in for. Its dry run changes nothing either.
+        $previewExe = if ($exe) { $exe } else {
+            ($installed | Sort-Object { [version]$_.'sort-version' } | Select-Object -Last 1).executable
+        }
+        if ($previewExe) {
+            Invoke-Native @($previewExe, $phase2, '-p', $projectPath, '--dry-run', '--target', $target) -EvenInDryRun
+        }
+        else {
+            Write-Step 'no managed Python installed yet — phase 2 (OS default, venv) cannot be previewed'
+        }
+    }
 }
 catch {
     Write-Warn $_.Exception.Message
