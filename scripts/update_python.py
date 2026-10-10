@@ -188,7 +188,8 @@ def update_tool(tool: str) -> None:
 
 
 def sync_uv(project: Path, exe: str) -> None:
-    uv_sync = ["uv", "sync", "--python", exe, "--no-managed-python", "--no-python-downloads"]
+    # --upgrade re-resolves the lock for the new Python instead of reusing old-Python pins.
+    uv_sync = ["uv", "sync", "--upgrade", "--python", exe, "--no-managed-python", "--no-python-downloads"]
     if run(uv_sync, cwd=project, check=False) == 0:
         return
     # uv failed. Usually the existing .venv is in the way, so move it aside and let uv
@@ -258,12 +259,18 @@ def sync_poetry(project: Path, exe: str) -> None:
         restore_aside(venv, venv_old)
         raise Abort(f"poetry env use {exe} failed")
 
+    # `poetry update`, not `install`: the lock was resolved for the old Python, and its pins
+    # may have no wheels for the new one (pydantic-core on 3.15 tried to build from Rust
+    # source). Re-resolving picks versions that ship wheels for the target interpreter.
+    if run(["poetry", "update"], cwd=project, check=False) != 0:
+        # Keep the old venv until the new one is complete — a half-installed venv is worse
+        # than staying on the previous Python.
+        restore_aside(venv, venv_old)
+        raise Abort("poetry update failed — kept the previous .venv; review output above")
+
     remove_dir(venv_old)
     if venv_old.exists() and not DRY_RUN:
         warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
-
-    if run(["poetry", "install"], cwd=project, check=False) != 0:
-        warn("poetry install reported errors — review output above")
 
 
 def rebuild_venv(project: Path, target: str, exe: str) -> None:
