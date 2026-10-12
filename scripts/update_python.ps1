@@ -168,14 +168,75 @@ function Initialize-PyManager {
     }
 }
 
-function Get-LatestStableVersion {
+function Get-StableVersions {
+    # Ascending, one entry per release — the catalog lists each release once per architecture.
     $stable = @(Get-PyManagerVersions -Online) | Where-Object {
         $_.company -eq 'PythonCore' -and
         $_.tag -notmatch '^\d+\.\d+t' -and
         $_.'sort-version' -match '^\d+\.\d+\.\d+$'
     }
     if (-not $stable) { throw 'no stable CPython found in the pymanager online catalog' }
-    return ($stable | Sort-Object { [version]$_.'sort-version' } | Select-Object -Last 1).'sort-version'
+    return @($stable | ForEach-Object { $_.'sort-version' } | Sort-Object { [version]$_ } -Unique)
+}
+
+function Get-InstalledExe([string]$Version) {
+    return (@(Get-InstalledCore) | Where-Object { $_.'sort-version' -eq $Version } | Select-Object -First 1).executable
+}
+
+function Get-NewestInstalledExe([string]$Minor) {
+    # $Minor narrows it to one minor; without it, the newest install of all.
+    $pool = @(Get-InstalledCore)
+    if ($Minor) { $pool = @($pool | Where-Object { $_.'sort-version' -like "$Minor.*" }) }
+    return ($pool | Sort-Object { [version]$_.'sort-version' } | Select-Object -Last 1).executable
+}
+
+function Install-CorePython([string]$Version) {
+    # Returns the interpreter, or nothing in a dry run when $Version is not installed yet.
+    $exe = Get-InstalledExe $Version
+    if ($exe) {
+        Write-Step "already installed: $exe"
+        return $exe
+    }
+
+    # pymanager keeps one directory per minor tag, so installing a newer patch
+    # deletes the install the current minor already lives in.
+    $minor = ($Version -split '\.')[0..1] -join '.'
+    $doomed = Get-NewestInstalledExe $minor
+    if ($doomed) {
+        $root = Split-Path $doomed -Parent
+        $blockers = @(Get-BlockingProcess $root)
+        if ($blockers) {
+            Write-Warn "Python $Version replaces $root, and these processes are holding it open:"
+            foreach ($b in $blockers) {
+                $what = if ($b.CommandLine) { $b.CommandLine } else { $b.Path }
+                Write-Host ("  PID {0,-8} {1}" -f $b.ProcessId, $what)
+            }
+            Write-Warn 'the list can be incomplete — elevated processes and other-bitness ones are not always visible.'
+            if (-not $DryRun) { throw 'stop the processes above, then re-run this script' }
+            Write-Warn 'a real run would stop here until they are closed'
+        }
+    }
+
+    Write-Step "installing Python $Version"
+    # Out-Host: this function's output is its return value, and pymanager's own output
+    # would otherwise end up in it.
+    Invoke-Native @('pymanager', 'install', $Version, '-y') | Out-Host
+    if ($DryRun) { return }
+    $exe = Get-InstalledExe $Version
+    if (-not $exe) { throw "Python $Version installed but not listed by pymanager" }
+    return $exe
+}
+
+function Resolve-VenvTarget([string]$PythonExe, [string]$ProjectPath, [string[]]$Candidates) {
+    # requires-python is PEP 440 (or Poetry's syntax), which PowerShell cannot evaluate, so
+    # an installed interpreter does it. It only reads and has exited before anything is
+    # installed, so it holds nothing open. Nothing returned: no release is accepted.
+    $resolver = Join-Path $PSScriptRoot 'project_python.py'
+    $out = & $PythonExe $resolver -p $ProjectPath @Candidates
+    $code = $LASTEXITCODE
+    if ($code -eq 2) { return }
+    if ($code -ne 0) { throw "cannot read the project's requires-python (exit $code)" }
+    return ([string]($out | Select-Object -Last 1)).Trim()
 }
 
 try {
@@ -185,58 +246,43 @@ try {
     Clear-ActivatedVenv
     Initialize-PyManager
 
-    $target = Get-LatestStableVersion
-    Write-Step "latest stable: Python $target"
+    $catalog = @(Get-StableVersions)
+    $latest = $catalog[-1]
+    Write-Step "latest stable: Python $latest"
+    $exe = Install-CorePython $latest
 
-    $installed = @(Get-InstalledCore)
-    $exe = ($installed | Where-Object { $_.'sort-version' -eq $target } | Select-Object -First 1).executable
-
-    if ($exe) {
-        Write-Step "already installed: $exe"
-    }
-    else {
-        # pymanager keeps one directory per minor tag, so installing a newer patch
-        # deletes the install the current minor already lives in.
-        $minor = ($target -split '\.')[0..1] -join '.'
-        $doomed = ($installed | Where-Object { $_.'sort-version' -like "$minor.*" } | Select-Object -First 1).executable
-        if ($doomed) {
-            $root = Split-Path $doomed -Parent
-            $blockers = @(Get-BlockingProcess $root)
-            if ($blockers) {
-                Write-Warn "Python $target replaces $root, and these processes are holding it open:"
-                foreach ($b in $blockers) {
-                    $what = if ($b.CommandLine) { $b.CommandLine } else { $b.Path }
-                    Write-Host ("  PID {0,-8} {1}" -f $b.ProcessId, $what)
-                }
-                Write-Warn 'the list can be incomplete — elevated processes and other-bitness ones are not always visible.'
-                if (-not $DryRun) { throw 'stop the processes above, then re-run this script' }
-                Write-Warn 'a real run would stop here until they are closed'
-            }
-        }
-
-        Write-Step "installing Python $target"
-        Invoke-Native @('pymanager', 'install', $target, '-y')
-        if (-not $DryRun) {
-            $exe = (@(Get-InstalledCore) | Where-Object { $_.'sort-version' -eq $target } | Select-Object -First 1).executable
-            if (-not $exe) { throw "Python $target installed but not listed by pymanager" }
+    # The OS default goes to the latest release, the venv to the newest one the project
+    # accepts. Usually the same; when requires-python caps it (a dependency without wheels
+    # for the newest minor), that branch is brought to its latest patch as well.
+    $venvTarget = $latest
+    $venvExe = $exe
+    $resolverExe = if ($exe) { $exe } else { Get-NewestInstalledExe }
+    if ($resolverExe) {
+        $picked = Resolve-VenvTarget $resolverExe $projectPath $catalog
+        if ($picked -and $picked -ne $latest) {
+            Write-Step "venv target: Python $picked (requires-python excludes $latest)"
+            $venvTarget = $picked
+            $venvExe = Install-CorePython $picked
         }
     }
 
-    # Phase 2 runs on the interpreter that was just installed, so nothing it does can be
-    # holding the files of an install still to be replaced. It also reads its target from
-    # the interpreter it is launched with, which is why $exe here is not just a convenience.
+    # Phase 2 runs on the venv's interpreter, so nothing it does can be holding the files of
+    # an install still to be replaced. It also reads its venv target from the interpreter it
+    # is launched with, which is why $venvExe here is not just a convenience.
     $phase2 = Join-Path $PSScriptRoot 'update_python.py'
     if (-not $DryRun) {
-        Invoke-Native @($exe, $phase2, '-p', $projectPath)
+        Invoke-Native @($venvExe, $phase2, '-p', $projectPath, '--os-default', $latest)
     }
     else {
-        # Nothing was installed, so preview phase 2 on the newest install there is and tell
-        # it which version it stands in for. Its dry run changes nothing either.
-        $previewExe = if ($exe) { $exe } else {
-            ($installed | Sort-Object { [version]$_.'sort-version' } | Select-Object -Last 1).executable
-        }
+        # Nothing was installed, so preview phase 2 on an install there is and tell it which
+        # version it stands in for. One of the target's minor first: a patch update lands in
+        # its directory, which lets phase 2 tell that the venv rides along. Its dry run
+        # changes nothing either.
+        $minor = ($venvTarget -split '\.')[0..1] -join '.'
+        $previewExe = if ($venvExe) { $venvExe } else { Get-NewestInstalledExe $minor }
+        if (-not $previewExe) { $previewExe = Get-NewestInstalledExe }
         if ($previewExe) {
-            Invoke-Native @($previewExe, $phase2, '-p', $projectPath, '--dry-run', '--target', $target) -EvenInDryRun
+            Invoke-Native @($previewExe, $phase2, '-p', $projectPath, '--dry-run', '--target', $venvTarget, '--os-default', $latest) -EvenInDryRun
         }
         else {
             Write-Step 'no managed Python installed yet — phase 2 (OS default, venv) cannot be previewed'

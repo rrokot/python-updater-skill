@@ -6,7 +6,9 @@ description: Update the Python interpreter on Windows to the latest official rel
 # Update Python (Python Install Manager + venv)
 
 Installs the latest official Python on Windows via the Python Install Manager,
-makes it the OS default, and rebuilds the project's uv/poetry venv on it.
+makes it the OS default, and rebuilds the project's uv/poetry venv on it — or, when
+the project's `requires-python` excludes the latest release, on the newest release
+it accepts, bringing that branch to its latest patch.
 
 ## Usage
 
@@ -39,6 +41,15 @@ updated, install manager updated, legacy launcher removed.
   directory that has an open file inside it. Same fix: close whatever holds it.
 - `Unable to find installation candidates` during the rebuild is a lock-file
   problem, not a Python one — `poetry update --no-cache <pkg>`.
+- Before a rebuild (dry run included) it lists locked packages with no wheel for
+  the target. A `WARNING` that names one with no wheel *even in the latest release*
+  means it would be built from source, which fails without a compiler. Relay it
+  before the real run; the options are staying on the current Python, capping
+  `requires-python` below the new minor, or installing MSVC Build Tools.
+- `venv target: Python X (requires-python excludes Y)` is expected for a capped
+  project: the OS default still goes to Y, the venv to X.
+- `outside requires-python … venv left alone` means no stable release satisfies
+  the constraint; `is not valid TOML` stops the run — fix `pyproject.toml` first.
 - After a real run the new default applies in fresh shells; suggest reopening the
   terminal and running the project's tests.
 - Windows only (Python Install Manager, PowerShell, winget).

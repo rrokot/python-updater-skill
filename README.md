@@ -44,17 +44,23 @@ Or run the script yourself from the project directory:
 
 1. Installs or upgrades the Python Install Manager and removes the legacy `py` launcher.
 2. Finds the latest stable CPython and installs it, unless it is already installed.
-3. Makes it the default Python for new terminals.
+   If the project's `requires-python` excludes it, also installs the newest release the
+   project accepts (for `>=3.14, <3.15`: the latest 3.14 patch).
+3. Makes the latest release the default Python for new terminals.
 4. Detects uv or Poetry from `uv.lock`, `poetry.lock` or `pyproject.toml` and upgrades
    the tool itself.
-5. Rebuilds the project's `.venv` on the new Python if it is on an older version,
-   with `uv sync` or `poetry env use` + `poetry install`.
+5. Warns about locked packages that have no wheel for the target Python and would have
+   to be built from source.
+6. Rebuilds the project's `.venv` on the target Python if it is on an older version,
+   with `uv sync --upgrade` or `poetry env use` + `poetry update`. A venv on an older
+   patch of the same minor needs no rebuild: the install is updated in place.
 
 The script can be run again safely: finished steps are skipped.
 
 ## Notes
 
-- There is no dry-run mode; changes apply immediately.
+- `-WhatIf` is a dry run: it reports what would be installed, removed and rebuilt, and
+  changes nothing.
 - If it stops with a list of process IDs, those processes are running from the Python
   being replaced. Close them (usually the IDE and terminals) and run it again.
 - If `.venv` cannot be moved or deleted, something still has files open in it; close

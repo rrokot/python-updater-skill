@@ -26,6 +26,9 @@ import sys
 import tomllib
 from pathlib import Path
 
+import project_python
+import wheel_check
+
 
 class Abort(Exception):
     pass
@@ -37,11 +40,13 @@ DRY_RUN = False
 
 
 def log(msg: str) -> None:
-    print(f"[update-python] {msg}")
+    # flush: phase 1 reads this through a pipe, where stdout is block-buffered and would
+    # fall behind the warnings on stderr.
+    print(f"[update-python] {msg}", flush=True)
 
 
 def warn(msg: str) -> None:
-    print(f"[update-python] WARNING: {msg}", file=sys.stderr)
+    print(f"[update-python] WARNING: {msg}", file=sys.stderr, flush=True)
 
 
 def run(cmd: list, *, check=True, cwd=None) -> int:
@@ -108,15 +113,40 @@ def detect_venv_tool(project: Path) -> str | None:
 
 
 def read_venv_version(venv: Path) -> str | None:
+    """The version the venv actually runs, asked of its own python.exe.
+
+    Not pyvenv.cfg: its `version` is written once, when the venv is created, while a patch
+    update of the base install (same directory) moves the venv along with it — a venv
+    running 3.14.7 still said 3.14.4 there. None for a venv that does not start, which is
+    what one whose base install is gone looks like, and that one needs rebuilding anyway.
+    """
+    exe = venv / "Scripts" / "python.exe"
+    if not exe.exists():
+        return None
+    try:
+        r = subprocess.run(
+            [str(exe), "-I", "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and re.fullmatch(r"\d+\.\d+\.\d+", out) else None
+
+
+def read_venv_home(venv: Path) -> str | None:
     cfg = venv / "pyvenv.cfg"
     if not cfg.exists():
         return None
     for line in cfg.read_text(encoding="utf-8").splitlines():
         key, _, val = line.partition("=")
-        if key.strip() in ("version", "version_info"):
-            m = re.search(r"\d+\.\d+\.\d+", val)
-            return m.group() if m else None
+        if key.strip() == "home":
+            return val.strip()
     return None
+
+
+def same_dir(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
 def remove_dir(path: Path) -> None:
@@ -273,6 +303,32 @@ def sync_poetry(project: Path, exe: str) -> None:
         warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
 
 
+def report_missing_wheels(project: Path, tool: str, target: str) -> None:
+    """Warn about compiled packages the target has no wheel for — before the venv is touched,
+    and in the dry run too, where it matters most. Never fatal: a machine with a compiler
+    builds them, and the rebuild keeps the old venv if one does not build."""
+    try:
+        gaps = wheel_check.find_gaps(project, tool, target)
+    except (OSError, tomllib.TOMLDecodeError, KeyError) as e:
+        warn(f"wheel check skipped — cannot read the lock file ({e})")
+        return
+    cp, plat = wheel_check.target_tags(target)
+    tag = f"{cp}-{plat}"
+    hard = []
+    for g in gaps:
+        if g.latest is None:
+            warn(f"{g.name} {g.locked}: no {tag} wheel, and PyPI could not be checked for a newer one")
+            hard.append(g.name)
+        elif g.latest_fits:
+            log(f"{g.name} {g.locked}: no {tag} wheel; {g.latest} has one and the re-resolve can pick it")
+        else:
+            warn(f"{g.name}: no {tag} wheel even in the latest release ({g.latest}) — it would be built from source")
+            hard.append(g.name)
+    if hard:
+        warn(f"building {', '.join(hard)} needs a compiler (MSVC Build Tools; Rust for some) — "
+             f"without one the rebuild fails and the previous .venv is kept")
+
+
 def rebuild_venv(project: Path, target: str, exe: str) -> None:
     tool = detect_venv_tool(project)
     if not tool:
@@ -281,10 +337,34 @@ def rebuild_venv(project: Path, target: str, exe: str) -> None:
     log(f"venv tool: {tool}")
     update_tool(tool)
 
-    current = read_venv_version(project / ".venv")
+    # Phase 1 already picks a target the project accepts. This catches the case where no
+    # release does, and keeps phase 2 honest when it is launched by hand.
+    try:
+        constraint = project_python.python_constraint(project)
+        accepted = constraint is None or project_python.satisfies(target, constraint)
+    except project_python.PyprojectError as e:
+        raise Abort(f"{e} — fix it, then re-run")
+    except project_python.ConstraintError as e:
+        warn(f"requires-python not understood ({e}) — not checked")
+        accepted = True
+    if not accepted:
+        warn(f"Python {target} is outside requires-python {constraint!r} — venv left alone")
+        return
+
+    venv = project / ".venv"
+    current = read_venv_version(venv)
     if current and version_key(current) >= version_key(target):
         log(f"venv already on {current} — skipping")
         return
+    home = read_venv_home(venv)
+    if current and current.split(".")[:2] == target.split(".")[:2] and home and same_dir(home, Path(exe).parent):
+        # The venv runs straight out of the install that a patch update replaces in place,
+        # so it is on the new patch as soon as phase 1 is done. Only a dry run gets here: a
+        # real one reads the new version off the venv and stops at the check above.
+        log(f"venv on {current} runs from {home} — the patch update carries it, no rebuild")
+        return
+
+    report_missing_wheels(project, tool, target)
     log(f"updating venv: {current or 'none'} → {target}")
 
     if tool == "uv":
@@ -304,6 +384,9 @@ def main(argv=None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="report what would change, change nothing")
     parser.add_argument("--target", help="with --dry-run: the version phase 1 would install. A dry run "
                                          "installs nothing, so it runs on an older interpreter.")
+    parser.add_argument("--os-default", metavar="VERSION",
+                        help="the release to make the OS default (default: the venv target). Phase 1 "
+                             "passes the latest one when requires-python holds the venv to an older one.")
     args = parser.parse_args(argv)
     if args.target and not args.dry_run:
         parser.error("--target is only for --dry-run; a real run targets the interpreter it runs on")
@@ -312,7 +395,11 @@ def main(argv=None) -> int:
     DRY_RUN = args.dry_run
     project = Path(args.project).resolve()
     if args.target:
-        target, exe = args.target, f"<python {args.target}>"
+        target = args.target
+        # pymanager keeps one directory per minor and updates a patch in place, so an
+        # interpreter of the target's minor already sits where the target will land.
+        same_minor = target.split(".")[:2] == [str(sys.version_info[0]), str(sys.version_info[1])]
+        exe = sys.executable if same_minor else f"<python {target}>"
     else:
         target, exe = "%d.%d.%d" % sys.version_info[:3], sys.executable
 
@@ -330,7 +417,7 @@ def main(argv=None) -> int:
             log("ignoring inherited VIRTUAL_ENV")
 
         log(f"target: Python {target} ({exe})")
-        set_default_python(target)
+        set_default_python(args.os_default or target)
         rebuild_venv(project, target, exe)
 
     except Abort as e:
