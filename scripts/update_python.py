@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""Phase 2 of the python-updater skill: make the running interpreter the OS default
-and rebuild the project's virtualenv on it.
-
-Not an entry point. update_python.ps1 installs the interpreter — from PowerShell,
-because pymanager replaces an install by deleting its directory and Windows refuses
-while its files are open — and then launches this script with the interpreter it just
-installed. Nothing here installs anything, so nothing here requires a Python to be closed.
-
-The target version and executable come from the interpreter running this script rather
-than from flags or from pymanager: launched with the right python.exe, phase 2 cannot
-disagree with phase 1.
-
-Usage:
-    powershell -File update_python.ps1
-"""
 import argparse
 import base64
 import hashlib
@@ -24,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import project_python
@@ -34,350 +21,305 @@ class Abort(Exception):
     pass
 
 
-# Set by --dry-run. Checked only at the points that change something — run, remove_dir,
-# rename_aside, the config write — so the dry run walks the same decisions as a real one.
-DRY_RUN = False
+def log(message: str) -> None:
+    print(f"[update-python] {message}", flush=True)
 
 
-def log(msg: str) -> None:
-    # flush: phase 1 reads this through a pipe, where stdout is block-buffered and would
-    # fall behind the warnings on stderr.
-    print(f"[update-python] {msg}", flush=True)
+def warn(message: str) -> None:
+    print(f"[update-python] WARNING: {message}", file=sys.stderr, flush=True)
 
 
-def warn(msg: str) -> None:
-    print(f"[update-python] WARNING: {msg}", file=sys.stderr, flush=True)
-
-
-def run(cmd: list, *, check=True, cwd=None) -> int:
-    label = " ".join(str(c) for c in cmd)
-    if DRY_RUN:
-        log(f"would run: {label}")
+def run_command(
+    command: list[str],
+    *,
+    dry_run: bool,
+    check: bool = True,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    command_line = " ".join(command)
+    if dry_run:
+        log(f"would run: {command_line}")
         return 0
-    log(f"$ {label}")
-    r = subprocess.run(cmd, cwd=cwd)
-    if check and r.returncode != 0:
-        raise Abort(f"command failed ({r.returncode}): {label}")
-    return r.returncode
+    log(f"$ {command_line}")
+    result = subprocess.run(command, cwd=cwd, env=env)
+    if check and result.returncode != 0:
+        raise Abort(f"command failed ({result.returncode}): {command_line}")
+    return result.returncode
 
 
-def version_key(ver: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in re.findall(r"\d+", ver)[:3])
+def release_version_parts(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
 
 
-# ── OS default ───────────────────────────────────────────────────────────────
+def minor_version_tag(version: str) -> str:
+    return ".".join(version.split(".")[:2])
 
-def set_default_python(version: str) -> None:
-    minor = ".".join(version.split(".")[:2])
-    cfg = Path(os.environ["APPDATA"]) / "Python" / "pymanager.json"
+
+def set_os_default_python(version: str, *, dry_run: bool) -> None:
+    minor_tag = minor_version_tag(version)
+    config_path = Path(os.environ["APPDATA"]) / "Python" / "pymanager.json"
     try:
-        data = json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
-    except json.JSONDecodeError as e:
-        # Rewriting it would throw away every other setting the user keeps there.
-        raise Abort(f"{cfg} is not valid JSON ({e}) — fix it, then re-run")
+        settings = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    except json.JSONDecodeError as error:
+        raise Abort(f"{config_path} is not valid JSON ({error}) — fix it, then re-run")
     if os.environ.get("PYTHON_MANAGER_DEFAULT"):
         warn("PYTHON_MANAGER_DEFAULT is set and overrides default_tag — "
              "the new default will not apply until it is removed")
-    if data.get("default_tag") == minor:
-        log(f"OS default already Python {minor}")
+    if settings.get("default_tag") == minor_tag:
+        log(f"OS default already Python {minor_tag}")
         return
-    if DRY_RUN:
-        log(f"would set OS default: Python {data.get('default_tag', 'none')} → {minor}")
+    if dry_run:
+        log(f"would set OS default: Python {settings.get('default_tag', 'none')} → {minor_tag}")
         return
-    data["default_tag"] = minor
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    log(f"OS default → Python {minor}")
+    settings["default_tag"] = minor_tag
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    log(f"OS default → Python {minor_tag}")
 
-
-# ── venv ─────────────────────────────────────────────────────────────────────
 
 def read_pyproject(project: Path) -> dict:
     try:
-        with open(project / "pyproject.toml", "rb") as f:
-            return tomllib.load(f)
+        with (project / "pyproject.toml").open("rb") as pyproject:
+            return tomllib.load(pyproject)
     except (FileNotFoundError, tomllib.TOMLDecodeError):
         return {}
 
 
 def detect_venv_tool(project: Path) -> str | None:
-    tool = read_pyproject(project).get("tool", {})
-    uv = (project / "uv.lock").exists() or "uv" in tool
-    poetry = (project / "poetry.lock").exists() or "poetry" in tool
-    if uv and poetry:
+    tool_settings = read_pyproject(project).get("tool", {})
+    uses_uv = (project / "uv.lock").exists() or "uv" in tool_settings
+    uses_poetry = (project / "poetry.lock").exists() or "poetry" in tool_settings
+    if uses_uv and uses_poetry:
         warn("project looks like both a uv and a poetry project — cannot tell which to use")
         return None
-    if not uv and not poetry:
+    if not uses_uv and not uses_poetry:
         return None
-    return "uv" if uv else "poetry"
+    return "uv" if uses_uv else "poetry"
 
 
-def read_venv_version(venv: Path) -> str | None:
-    """The version the venv actually runs, asked of its own python.exe.
-
-    Not pyvenv.cfg: its `version` is written once, when the venv is created, while a patch
-    update of the base install (same directory) moves the venv along with it — a venv
-    running 3.14.7 still said 3.14.4 there. None for a venv that does not start, which is
-    what one whose base install is gone looks like, and that one needs rebuilding anyway.
-    """
-    exe = venv / "Scripts" / "python.exe"
-    if not exe.exists():
+def read_running_venv_version(venv: Path) -> str | None:
+    venv_python = venv / "Scripts" / "python.exe"
+    if not venv_python.exists():
         return None
+    print_version = "import sys; print('%d.%d.%d' % sys.version_info[:3])"
     try:
-        r = subprocess.run(
-            [str(exe), "-I", "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
-            capture_output=True, text=True, timeout=60,
+        result = subprocess.run(
+            [str(venv_python), "-I", "-c", print_version],
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    out = r.stdout.strip()
-    return out if r.returncode == 0 and re.fullmatch(r"\d+\.\d+\.\d+", out) else None
+    version = result.stdout.strip()
+    return version if result.returncode == 0 and re.fullmatch(r"\d+\.\d+\.\d+", version) else None
 
 
-def read_venv_home(venv: Path) -> str | None:
-    cfg = venv / "pyvenv.cfg"
-    if not cfg.exists():
+def read_venv_base_install(venv: Path) -> str | None:
+    config_path = venv / "pyvenv.cfg"
+    if not config_path.exists():
         return None
-    for line in cfg.read_text(encoding="utf-8").splitlines():
-        key, _, val = line.partition("=")
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
         if key.strip() == "home":
-            return val.strip()
+            return value.strip()
     return None
 
 
-def same_dir(a: str, b: str) -> bool:
-    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+def same_directory(first: str | Path, second: str | Path) -> bool:
+    return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
 
 
-def remove_dir(path: Path) -> None:
-    """Best-effort delete. Every caller re-checks and reports what survived, because
-    a directory the IDE still has handles in cannot be removed until it lets go."""
-    if DRY_RUN:
+def try_remove_directory(path: Path, *, dry_run: bool) -> None:
+    if dry_run:
         if path.exists():
             log(f"would remove {path}")
         return
     shutil.rmtree(path, ignore_errors=True)
 
 
-def rename_aside(path: Path) -> Path:
-    """Move path → path_old so a tool that refuses to overwrite can build a fresh one.
-
-    This does not defeat a lock: Windows will not rename a directory that still has an
-    open file inside it, whatever sharing mode the holder used. Failing here with the
-    OS error beats letting the caller retry against a directory that never moved.
-    """
-    aside = path.parent / (path.name + "_old")
-    remove_dir(aside)
-    if DRY_RUN:
-        if path.exists():
-            log(f"would move {path} → {aside.name}")
-        return aside
-    if path.exists():
-        try:
-            path.rename(aside)
-        except OSError as e:
-            raise Abort(f"cannot move {path} aside: {e}")
-    return aside
-
-
-def restore_aside(path: Path, aside: Path) -> None:
-    """Undo rename_aside after a failed rebuild, so the project keeps its old, working venv
-    instead of being left with nothing but path_old."""
-    if not aside.exists():
-        return
-    remove_dir(path)  # whatever half-built venv the failed attempt left behind
+def backup_venv(venv: Path, *, dry_run: bool) -> Path:
+    backup = venv.with_name(f"{venv.name}_old")
+    try_remove_directory(backup, dry_run=dry_run)
+    if not venv.exists():
+        return backup
+    if dry_run:
+        log(f"would move {venv} → {backup.name}")
+        return backup
     try:
-        if path.exists():
+        venv.rename(backup)
+    except OSError as error:
+        raise Abort(f"cannot move {venv} aside: {error}")
+    return backup
+
+
+def restore_venv_backup(venv: Path, backup: Path) -> None:
+    if not backup.exists():
+        return
+    try_remove_directory(venv, dry_run=False)
+    try:
+        if venv.exists():
             raise OSError("a partial venv is still in the way")
-        aside.rename(path)
-        log(f"restored the previous {path.name}")
-    except OSError as e:
-        warn(f"could not restore {path.name} from {aside.name} ({e}) — rename it back by hand")
+        backup.rename(venv)
+        log(f"restored the previous {venv.name}")
+    except OSError as error:
+        warn(f"could not restore {venv.name} from {backup.name} ({error}) — rename it back by hand")
 
 
-def update_tool(tool: str) -> None:
-    """Freshen the venv manager itself. Runs whether or not the venv needs rebuilding,
-    and is never fatal — a stale uv or poetry is no reason to abandon a Python update."""
+@contextmanager
+def rebuild_with_venv_backup(venv: Path, *, dry_run: bool) -> Iterator[None]:
+    backup = backup_venv(venv, dry_run=dry_run)
+    try:
+        yield
+    except Abort:
+        if not dry_run:
+            restore_venv_backup(venv, backup)
+        raise
+    try_remove_directory(backup, dry_run=dry_run)
+    if backup.exists() and not dry_run:
+        warn(f"{backup.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
+
+
+def try_update_venv_tool(tool: str, *, dry_run: bool) -> None:
     if tool == "uv":
-        # A standalone-installed uv updates itself; one installed through pip or winget
-        # refuses, and that refusal is not an error worth stopping for.
-        if run(["uv", "self", "update"], check=False) != 0:
+        if run_command(["uv", "self", "update"], dry_run=dry_run, check=False) != 0:
             warn("uv self update failed — continuing with the installed uv")
         return
 
-    # Poetry is upgraded in place. Tearing its venv down and rebuilding it on the new
-    # interpreter was tried and dropped: the venv does not break in the first place — it
-    # names its install by path, a patch bump replaces that directory with an ABI-compatible
-    # one, and a minor bump leaves it alone — while the teardown left the machine with no
-    # poetry at all whenever the reinstall could not reach PyPI.
     poetry_pip = Path(os.environ["APPDATA"]) / "pypoetry" / "venv" / "Scripts" / "pip.exe"
     if poetry_pip.exists():
         log("upgrading Poetry")
-        if run([str(poetry_pip), "install", "--upgrade", "poetry"], check=False) != 0:
+        upgrade_poetry = [str(poetry_pip), "install", "--upgrade", "poetry"]
+        if run_command(upgrade_poetry, dry_run=dry_run, check=False) != 0:
             warn("Poetry upgrade failed — continuing with the installed version")
 
 
-def sync_uv(project: Path, exe: str) -> None:
-    # --upgrade re-resolves the lock for the new Python instead of reusing old-Python pins.
-    uv_sync = ["uv", "sync", "--upgrade", "--python", exe, "--no-managed-python", "--no-python-downloads"]
-    if run(uv_sync, cwd=project, check=False) == 0:
+def sync_uv_venv(project: Path, python_executable: str, *, dry_run: bool) -> None:
+    sync_command = [
+        "uv", "sync", "--upgrade", "--python", python_executable,
+        "--no-managed-python", "--no-python-downloads",
+    ]
+    if run_command(sync_command, cwd=project, dry_run=dry_run, check=False) == 0:
         return
-    # uv failed. Usually the existing .venv is in the way, so move it aside and let uv
-    # build a fresh one. If something genuinely holds the directory open, the move fails
-    # and says so — that is a process to close, not something a retry can fix.
     log("uv sync failed — moving .venv aside and retrying")
-    venv = project / ".venv"
-    venv_old = rename_aside(venv)
-    try:
-        run(uv_sync, cwd=project)
-    except Abort:
-        # The venv was not the problem after all (resolution, network, ...).
-        restore_aside(venv, venv_old)
-        raise
-    remove_dir(venv_old)
-    if venv_old.exists() and not DRY_RUN:
-        warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
+    with rebuild_with_venv_backup(project / ".venv", dry_run=dry_run):
+        run_command(sync_command, cwd=project, dry_run=dry_run)
 
 
-def poetry_env_name(project: Path) -> str | None:
-    """The cache env name Poetry gives this project, minus the "-py<X.Y>" suffix.
-
-    Mirrors EnvManager.generate_env_name exactly. Its input is package.name, which
-    poetry-core canonicalizes (PEP 503: runs of "-", "_", "." become "-"), and the hash is
-    of the project's own path — so another project that shares the name but not the
-    directory never has its env touched.
-    """
-    data = read_pyproject(project)
-    name = (
-        data.get("project", {}).get("name")
-        or data.get("tool", {}).get("poetry", {}).get("name")
+def poetry_cache_env_base_name(project: Path) -> str | None:
+    pyproject = read_pyproject(project)
+    package_name = (
+        pyproject.get("project", {}).get("name")
+        or pyproject.get("tool", {}).get("poetry", {}).get("name")
     )
-    if not name:
+    if not package_name:
         return None
-    name = re.sub(r"[-_.]+", "-", name).lower()
-    sanitized = re.sub(r'[ $`!*@"\\\r\n\t]', "_", name)[:42]
-    cwd = os.path.normcase(os.path.realpath(project))
-    digest = base64.urlsafe_b64encode(hashlib.sha256(cwd.encode()).digest()).decode()[:8]
-    return f"{sanitized}-{digest}"
+    canonical_name = re.sub(r"[-_.]+", "-", package_name).lower()
+    sanitized_name = re.sub(r'[ $`!*@"\\\r\n\t]', "_", canonical_name)[:42]
+    normalized_project_path = os.path.normcase(os.path.realpath(project))
+    project_digest = hashlib.sha256(normalized_project_path.encode()).digest()
+    project_hash = base64.urlsafe_b64encode(project_digest).decode()[:8]
+    return f"{sanitized_name}-{project_hash}"
 
 
-def _remove_stale_poetry_cache_envs(project: Path) -> None:
-    env_name = poetry_env_name(project)
-    if not env_name:
+def remove_stale_poetry_cache_envs(project: Path, *, dry_run: bool) -> None:
+    base_name = poetry_cache_env_base_name(project)
+    if not base_name:
         return
-    pattern = re.compile(rf"^{re.escape(env_name)}-py\d+\.\d+$")
+    project_env_name = re.compile(rf"^{re.escape(base_name)}-py\d+\.\d+$")
     cache_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "pypoetry" / "Cache" / "virtualenvs"
     if not cache_dir.exists():
         return
     for entry in cache_dir.iterdir():
-        if entry.is_dir() and pattern.match(entry.name):
-            if not DRY_RUN:
+        if entry.is_dir() and project_env_name.match(entry.name):
+            if not dry_run:
                 log(f"removing stale poetry cache env: {entry}")
-            remove_dir(entry)
+            try_remove_directory(entry, dry_run=dry_run)
 
 
-def sync_poetry(project: Path, exe: str) -> None:
-    _remove_stale_poetry_cache_envs(project)
-    venv = project / ".venv"
-    venv_old = rename_aside(venv)
-
-    # The venv belongs in the project, but `poetry config` would make that the rule for
-    # every project on the machine (and --local would drop a poetry.toml into the repo).
-    # An env var scopes it to the poetry calls below; later runs pick up .venv by itself.
-    os.environ["POETRY_VIRTUALENVS_IN_PROJECT"] = "true"
-    if run(["poetry", "env", "use", exe], cwd=project, check=False) != 0:
-        restore_aside(venv, venv_old)
-        raise Abort(f"poetry env use {exe} failed")
-
-    # `poetry update`, not `install`: the lock was resolved for the old Python, and its pins
-    # may have no wheels for the new one (pydantic-core on 3.15 tried to build from Rust
-    # source). Re-resolving picks versions that ship wheels for the target interpreter.
-    if run(["poetry", "update"], cwd=project, check=False) != 0:
-        # Keep the old venv until the new one is complete — a half-installed venv is worse
-        # than staying on the previous Python.
-        restore_aside(venv, venv_old)
-        raise Abort("poetry update failed — kept the previous .venv; review output above")
-
-    remove_dir(venv_old)
-    if venv_old.exists() and not DRY_RUN:
-        warn(f"{venv_old.name} not deleted — IDE still holds handles; remove it after restarting the IDE")
+def sync_poetry_venv(project: Path, python_executable: str, *, dry_run: bool) -> None:
+    remove_stale_poetry_cache_envs(project, dry_run=dry_run)
+    poetry_env = {**os.environ, "POETRY_VIRTUALENVS_IN_PROJECT": "true"}
+    use_python = ["poetry", "env", "use", python_executable]
+    with rebuild_with_venv_backup(project / ".venv", dry_run=dry_run):
+        use_python_status = run_command(use_python, cwd=project, env=poetry_env, dry_run=dry_run, check=False)
+        if use_python_status != 0:
+            raise Abort(f"poetry env use {python_executable} failed")
+        update_status = run_command(["poetry", "update"], cwd=project, env=poetry_env, dry_run=dry_run, check=False)
+        if update_status != 0:
+            raise Abort("poetry update failed — kept the previous .venv; review output above")
 
 
-def report_missing_wheels(project: Path, tool: str, target: str) -> None:
-    """Warn about compiled packages the target has no wheel for — before the venv is touched,
-    and in the dry run too, where it matters most. Never fatal: a machine with a compiler
-    builds them, and the rebuild keeps the old venv if one does not build."""
+def report_missing_wheels(project: Path, tool: str, target_version: str) -> None:
     try:
-        gaps = wheel_check.find_gaps(project, tool, target)
-    except (OSError, tomllib.TOMLDecodeError, KeyError) as e:
-        warn(f"wheel check skipped — cannot read the lock file ({e})")
+        gaps = wheel_check.find_gaps(project, tool, target_version)
+    except (OSError, tomllib.TOMLDecodeError, KeyError) as error:
+        warn(f"wheel check skipped — cannot read the lock file ({error})")
         return
-    cp, plat = wheel_check.target_tags(target)
-    tag = f"{cp}-{plat}"
-    hard = []
-    for g in gaps:
-        if g.latest is None:
-            warn(f"{g.name} {g.locked}: no {tag} wheel, and PyPI could not be checked for a newer one")
-            hard.append(g.name)
-        elif g.latest_fits:
-            log(f"{g.name} {g.locked}: no {tag} wheel; {g.latest} has one and the re-resolve can pick it")
+    python_tag, platform_tag = wheel_check.target_tags(target_version)
+    wheel_tag = f"{python_tag}-{platform_tag}"
+    packages_requiring_build = []
+    for gap in gaps:
+        if gap.latest is None:
+            warn(f"{gap.name} {gap.locked}: no {wheel_tag} wheel, and PyPI could not be checked for a newer one")
+            packages_requiring_build.append(gap.name)
+        elif gap.latest_fits:
+            log(f"{gap.name} {gap.locked}: no {wheel_tag} wheel; {gap.latest} has one and the re-resolve can pick it")
         else:
-            warn(f"{g.name}: no {tag} wheel even in the latest release ({g.latest}) — it would be built from source")
-            hard.append(g.name)
-    if hard:
-        warn(f"building {', '.join(hard)} needs a compiler (MSVC Build Tools; Rust for some) — "
+            warn(f"{gap.name}: no {wheel_tag} wheel even in the latest release ({gap.latest}) — it would be built from source")
+            packages_requiring_build.append(gap.name)
+    if packages_requiring_build:
+        warn(f"building {', '.join(packages_requiring_build)} needs a compiler (MSVC Build Tools; Rust for some) — "
              f"without one the rebuild fails and the previous .venv is kept")
 
 
-def rebuild_venv(project: Path, target: str, exe: str) -> None:
+def rebuild_project_venv(project: Path, target_version: str, python_executable: str, *, dry_run: bool) -> None:
     tool = detect_venv_tool(project)
     if not tool:
         log("no uv/poetry project detected — skipping venv update")
         return
     log(f"venv tool: {tool}")
-    update_tool(tool)
+    try_update_venv_tool(tool, dry_run=dry_run)
 
-    # Phase 1 already picks a target the project accepts. This catches the case where no
-    # release does, and keeps phase 2 honest when it is launched by hand.
     try:
         constraint = project_python.python_constraint(project)
-        accepted = constraint is None or project_python.satisfies(target, constraint)
-    except project_python.PyprojectError as e:
-        raise Abort(f"{e} — fix it, then re-run")
-    except project_python.ConstraintError as e:
-        warn(f"requires-python not understood ({e}) — not checked")
-        accepted = True
-    if not accepted:
-        warn(f"Python {target} is outside requires-python {constraint!r} — venv left alone")
-        return
+        if constraint is not None and not project_python.satisfies(target_version, constraint):
+            warn(f"Python {target_version} is outside requires-python {constraint!r} — venv left alone")
+            return
+    except project_python.PyprojectError as error:
+        raise Abort(f"{error} — fix it, then re-run")
+    except project_python.ConstraintError as error:
+        warn(f"requires-python not understood ({error}) — not checked")
 
     venv = project / ".venv"
-    current = read_venv_version(venv)
-    if current and version_key(current) >= version_key(target):
-        log(f"venv already on {current} — skipping")
+    current_version = read_running_venv_version(venv)
+    if current_version and release_version_parts(current_version) >= release_version_parts(target_version):
+        log(f"venv already on {current_version} — skipping")
         return
-    home = read_venv_home(venv)
-    if current and current.split(".")[:2] == target.split(".")[:2] and home and same_dir(home, Path(exe).parent):
-        # The venv runs straight out of the install that a patch update replaces in place,
-        # so it is on the new patch as soon as phase 1 is done. Only a dry run gets here: a
-        # real one reads the new version off the venv and stops at the check above.
-        log(f"venv on {current} runs from {home} — the patch update carries it, no rebuild")
+    base_install = read_venv_base_install(venv)
+    patch_update_keeps_venv = (
+        current_version
+        and minor_version_tag(current_version) == minor_version_tag(target_version)
+        and base_install
+        and same_directory(base_install, Path(python_executable).parent)
+    )
+    if patch_update_keeps_venv:
+        log(f"venv on {current_version} runs from {base_install} — the patch update carries it, no rebuild")
         return
 
-    report_missing_wheels(project, tool, target)
-    log(f"updating venv: {current or 'none'} → {target}")
+    report_missing_wheels(project, tool, target_version)
+    log(f"updating venv: {current_version or 'none'} → {target_version}")
 
     if tool == "uv":
-        sync_uv(project, exe)
+        sync_uv_venv(project, python_executable, dry_run=dry_run)
     else:
-        sync_poetry(project, exe)
+        sync_poetry_venv(project, python_executable, dry_run=dry_run)
 
 
-# ── entry point ──────────────────────────────────────────────────────────────
-
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Make the running interpreter the OS default and rebuild the project venv "
+        description="Set the OS default Python and rebuild the project venv "
                     "(phase 2 of update_python.ps1).",
     )
     parser.add_argument("-p", "--project", default=".", help="project directory (default: cwd)")
@@ -391,17 +333,13 @@ def main(argv=None) -> int:
     if args.target and not args.dry_run:
         parser.error("--target is only for --dry-run; a real run targets the interpreter it runs on")
 
-    global DRY_RUN
-    DRY_RUN = args.dry_run
     project = Path(args.project).resolve()
-    if args.target:
-        target = args.target
-        # pymanager keeps one directory per minor and updates a patch in place, so an
-        # interpreter of the target's minor already sits where the target will land.
-        same_minor = target.split(".")[:2] == [str(sys.version_info[0]), str(sys.version_info[1])]
-        exe = sys.executable if same_minor else f"<python {target}>"
+    running_version = ".".join(map(str, sys.version_info[:3]))
+    target_version = args.target or running_version
+    if minor_version_tag(target_version) != minor_version_tag(running_version):
+        python_executable = f"<python {target_version}>"
     else:
-        target, exe = "%d.%d.%d" % sys.version_info[:3], sys.executable
+        python_executable = sys.executable
 
     try:
         if sys.prefix != sys.base_prefix:
@@ -410,21 +348,18 @@ def main(argv=None) -> int:
                 f"cannot work. Launch with a base interpreter, or just run update_python.ps1."
             )
 
-        # An activated venv leaks in via VIRTUAL_ENV. Poetry treats it as the project
-        # env: once the stale cache env is deleted it reports it "broken" and recreates
-        # .venv, and uv warns about the mismatch. Child tools must not see it.
         if os.environ.pop("VIRTUAL_ENV", None):
             log("ignoring inherited VIRTUAL_ENV")
 
-        log(f"target: Python {target} ({exe})")
-        set_default_python(args.os_default or target)
-        rebuild_venv(project, target, exe)
+        log(f"target: Python {target_version} ({python_executable})")
+        set_os_default_python(args.os_default or target_version, dry_run=args.dry_run)
+        rebuild_project_venv(project, target_version, python_executable, dry_run=args.dry_run)
 
-    except Abort as e:
-        warn(str(e))
+    except Abort as error:
+        warn(str(error))
         return 1
 
-    log("dry run done — nothing was changed" if DRY_RUN else "done")
+    log("dry run done — nothing was changed" if args.dry_run else "done")
     return 0
 
 
