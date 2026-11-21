@@ -1,13 +1,3 @@
-"""Which locked packages have no wheel for the target Python, before a rebuild finds out.
-
-Rebuilding a venv on a new minor re-resolves the lock. A compiled package with no wheel
-for the new interpreter is then built from source, and on a machine without a C or Rust
-toolchain that fails halfway through the rebuild (PyYAML on 3.15 did). This looks ahead:
-the lock lists the files of each pinned release, PyPI says whether its latest release
-does better.
-
-Stdlib only, like the rest of phase 2. Reads only, so the dry run does all of it too.
-"""
 import json
 import os
 import platform
@@ -19,61 +9,60 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-PYPI_TIMEOUT = 10
+PYPI_TIMEOUT_SECONDS = 10
 
 
 @dataclass
 class Gap:
     name: str
     locked: str
-    latest: str | None        # None: PyPI could not be asked
+    latest: str | None
     latest_fits: bool = False
 
 
-def target_tags(target: str) -> tuple[str, str]:
-    """(cpXY, platform) the target interpreter accepts wheels for, e.g. ("cp315", "win_amd64").
-
-    The platform is that of the interpreter running this. The dry run may be on an older
-    Python than the target, but it is on the same machine and of the same bitness.
-    """
-    major, minor = target.split(".")[:2]
-    plat = re.sub(r"[-.]", "_", sysconfig.get_platform())
-    return f"cp{major}{minor}", plat
+def target_tags(target_version: str) -> tuple[str, str]:
+    major, minor = target_version.split(".")[:2]
+    host_platform_tag = re.sub(r"[-.]", "_", sysconfig.get_platform())
+    return f"cp{major}{minor}", host_platform_tag
 
 
-def wheel_fits(filename: str, cp: str, plat: str) -> bool:
-    parts = filename[:-len(".whl")].split("-")
-    if len(parts) < 5:
+def wheel_fits(filename: str, python_tag: str, platform_tag: str) -> bool:
+    filename_parts = filename[:-len(".whl")].split("-")
+    if len(filename_parts) < 5:
         return False
-    py_tags, abi_tags, plat_tags = (set(p.split(".")) for p in parts[-3:])
-    if not plat_tags & {plat, "any"}:
+    wheel_python_tags, wheel_abi_tags, wheel_platform_tags = (
+        set(compressed_tags.split(".")) for compressed_tags in filename_parts[-3:]
+    )
+    if not wheel_platform_tags & {platform_tag, "any"}:
         return False
-    minor = int(cp[3:])
-    for py in py_tags:
-        for abi in abi_tags:
-            if abi == "none" and py in ("py3", f"py3{minor}", cp):
+    target_minor = int(python_tag[3:])
+    abi_independent_python_tags = {"py3", f"py3{target_minor}", python_tag}
+    for wheel_python_tag in wheel_python_tags:
+        for wheel_abi_tag in wheel_abi_tags:
+            if wheel_abi_tag == "none" and wheel_python_tag in abi_independent_python_tags:
                 return True
-            # Stable ABI: built for 3.N, loads on every later 3.x.
-            if abi == "abi3" and re.fullmatch(r"cp3\d+", py) and int(py[3:]) <= minor:
+            if wheel_abi_tag == python_tag and wheel_python_tag == python_tag:
                 return True
-            # Exact ABI only — cp315t is the free-threaded build, not this one.
-            if abi == cp and py == cp:
-                return True
+            if wheel_abi_tag == "abi3" and re.fullmatch(r"cp3\d+", wheel_python_tag):
+                minimum_minor = int(wheel_python_tag[3:])
+                if minimum_minor <= target_minor:
+                    return True
     return False
 
 
-# ── PEP 508 markers ──────────────────────────────────────────────────────────
+_MARKER_TOKEN_PATTERN = re.compile(
+    r"\s*(\(|\)|not\s+in\b|in\b|and\b|or\b|===|==|!=|~=|<=|>=|<|>|"
+    r'''"[^"]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_.]*)'''
+)
+_MARKER_COMPARISON_OPERATORS = {"===", "==", "!=", "~=", "<=", ">=", "<", ">", "in", "not in"}
+_MARKER_VERSION_VARIABLES = {"python_version", "python_full_version", "implementation_version"}
 
-_TOKEN = re.compile(r"""\s*(\(|\)|not\s+in\b|in\b|and\b|or\b|===|==|!=|~=|<=|>=|<|>|"[^"]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_.]*)""")
-_OPS = {"===", "==", "!=", "~=", "<=", ">=", "<", ">", "in", "not in"}
-_VERSION_VARS = {"python_version", "python_full_version", "implementation_version"}
 
-
-def marker_env(target: str) -> dict[str, str]:
+def marker_env(target_version: str) -> dict[str, str]:
     return {
-        "python_version": ".".join(target.split(".")[:2]),
-        "python_full_version": target,
-        "implementation_version": target,
+        "python_version": ".".join(target_version.split(".")[:2]),
+        "python_full_version": target_version,
+        "implementation_version": target_version,
         "implementation_name": "cpython",
         "platform_python_implementation": "CPython",
         "sys_platform": sys.platform,
@@ -85,171 +74,177 @@ def marker_env(target: str) -> dict[str, str]:
     }
 
 
-def _version_cmp(a: str, op: str, b: str) -> bool:
-    x = tuple(int(v) for v in re.findall(r"\d+", a))
-    y = tuple(int(v) for v in re.findall(r"\d+", b))
-    kept = len(y) - 1  # for ~=: everything but the last component of the right side
-    n = max(len(x), len(y))
-    x, y = x + (0,) * (n - len(x)), y + (0,) * (n - len(y))
-    if op == "~=":
-        return x >= y and x[:kept] == y[:kept]
-    return {"==": x == y, "===": x == y, "!=": x != y, "<": x < y,
-            "<=": x <= y, ">": x > y, ">=": x >= y}.get(op, True)
+def _matches_version_comparison(left_version: str, operator: str, right_version: str) -> bool:
+    left_parts = tuple(int(part) for part in re.findall(r"\d+", left_version))
+    right_parts = tuple(int(part) for part in re.findall(r"\d+", right_version))
+    compatible_prefix_length = len(right_parts) - 1
+    length = max(len(left_parts), len(right_parts))
+    left = left_parts + (0,) * (length - len(left_parts))
+    right = right_parts + (0,) * (length - len(right_parts))
+    if operator == "~=":
+        return left >= right and left[:compatible_prefix_length] == right[:compatible_prefix_length]
+    return {
+        "==": left == right,
+        "===": left == right,
+        "!=": left != right,
+        "<": left < right,
+        "<=": left <= right,
+        ">": left > right,
+        ">=": left >= right,
+    }.get(operator, True)
 
 
-def _compare(lhs, op: str, rhs, env: dict) -> bool:
-    def value(tok):
-        if tok[0] in "\"'":
-            return tok[1:-1], None
-        return env.get(tok), tok
-    left, lvar = value(lhs)
-    right, rvar = value(rhs)
+def _matches_marker_comparison(left_operand: str, operator: str, right_operand: str, env: dict[str, str]) -> bool:
+    def resolve_operand(operand: str) -> tuple[str | None, str | None]:
+        if operand[0] in "\"'":
+            return operand[1:-1], None
+        return env.get(operand), operand
+
+    left, left_variable = resolve_operand(left_operand)
+    right, right_variable = resolve_operand(right_operand)
     if left is None or right is None:
-        # `extra`, or a variable this module does not model: assume the package is
-        # installed. A needless warning is cheaper than a missed one.
         return True
-    if op in ("in", "not in"):
-        return (left in right) == (op == "in")
-    if {lvar, rvar} & _VERSION_VARS:
-        return _version_cmp(left, op, right)
-    if op == "==":
+    if operator in ("in", "not in"):
+        return (left in right) == (operator == "in")
+    if {left_variable, right_variable} & _MARKER_VERSION_VARIABLES:
+        return _matches_version_comparison(left, operator, right)
+    if operator == "==":
         return left == right
-    if op == "!=":
+    if operator == "!=":
         return left != right
     return True
 
 
-def marker_applies(marker: str, env: dict) -> bool:
-    """Evaluate a PEP 508 marker for env. Anything unparseable counts as applying."""
-    tokens, pos = [], 0
+def marker_applies(marker: str, env: dict[str, str]) -> bool:
+    tokens = []
+    token_start = 0
     marker = marker.strip()
-    while pos < len(marker):
-        m = _TOKEN.match(marker, pos)
-        if not m:
+    while token_start < len(marker):
+        token = _MARKER_TOKEN_PATTERN.match(marker, token_start)
+        if token is None:
             return True
-        tokens.append(re.sub(r"\s+", " ", m.group(1)))
-        pos = m.end()
-        while pos < len(marker) and marker[pos].isspace():
-            pos += 1
+        tokens.append(re.sub(r"\s+", " ", token.group(1)))
+        token_start = token.end()
 
-    i = 0
+    token_index = 0
 
-    def peek():
-        return tokens[i] if i < len(tokens) else None
+    def next_token() -> str | None:
+        return tokens[token_index] if token_index < len(tokens) else None
 
-    def expr():
-        nonlocal i
-        result = term()
-        while peek() == "or":
-            i += 1
-            rhs = term()
-            result = result or rhs
-        return result
+    def parse_disjunction() -> bool:
+        nonlocal token_index
+        matches = parse_conjunction()
+        while next_token() == "or":
+            token_index += 1
+            right_matches = parse_conjunction()
+            matches = matches or right_matches
+        return matches
 
-    def term():
-        nonlocal i
-        result = atom()
-        while peek() == "and":
-            i += 1
-            rhs = atom()
-            result = result and rhs
-        return result
+    def parse_conjunction() -> bool:
+        nonlocal token_index
+        matches = parse_atom()
+        while next_token() == "and":
+            token_index += 1
+            right_matches = parse_atom()
+            matches = matches and right_matches
+        return matches
 
-    def atom():
-        nonlocal i
-        if peek() == "(":
-            i += 1
-            result = expr()
-            if peek() != ")":
+    def parse_atom() -> bool:
+        nonlocal token_index
+        if next_token() == "(":
+            token_index += 1
+            matches = parse_disjunction()
+            if next_token() != ")":
                 raise ValueError("unbalanced parentheses")
-            i += 1
-            return result
-        if i + 3 > len(tokens):
+            token_index += 1
+            return matches
+        if token_index + 3 > len(tokens):
             raise ValueError("truncated comparison")
-        lhs, op, rhs = tokens[i:i + 3]
-        if op not in _OPS:
-            raise ValueError(f"{op!r} is not a comparison")
-        i += 3
-        return _compare(lhs, op, rhs, env)
+        left, operator, right = tokens[token_index:token_index + 3]
+        if operator not in _MARKER_COMPARISON_OPERATORS:
+            raise ValueError(f"{operator!r} is not a comparison")
+        token_index += 3
+        return _matches_marker_comparison(left, operator, right, env)
 
     try:
-        result = expr()
-        if i != len(tokens):
+        matches = parse_disjunction()
+        if token_index != len(tokens):
             return True
-        return result
+        return matches
     except (ValueError, IndexError):
         return True
 
 
-# ── lock files ───────────────────────────────────────────────────────────────
-
-def _locked_poetry(project: Path, env: dict) -> list[tuple[str, str, list[str]]]:
-    with open(project / "poetry.lock", "rb") as f:
-        lock = tomllib.load(f)
-    out = []
-    for p in lock.get("package", []):
-        # A path, git or url dependency is built from what it points at, not from PyPI.
-        if p.get("source", {}).get("type") in ("directory", "file", "git", "url"):
+def _locked_poetry_registry_packages(lock_path: Path, env: dict[str, str]) -> list[tuple[str, str, list[str]]]:
+    with lock_path.open("rb") as lock_file:
+        lock = tomllib.load(lock_file)
+    packages = []
+    for package in lock.get("package", []):
+        source_type = package.get("source", {}).get("type")
+        if source_type in ("directory", "file", "git", "url"):
             continue
-        markers = p.get("markers")
+        markers = package.get("markers")
         if isinstance(markers, str) and not marker_applies(markers, env):
             continue
-        # Lock 2.1 may key markers by dependency group: installed if any group installs it.
-        if isinstance(markers, dict) and not any(marker_applies(m, env) for m in markers.values()):
+        if isinstance(markers, dict) and not any(
+            marker_applies(group_marker, env) for group_marker in markers.values()
+        ):
             continue
-        out.append((p["name"], p["version"], [f["file"] for f in p.get("files", [])]))
-    return out
+        filenames = [distribution["file"] for distribution in package.get("files", [])]
+        packages.append((package["name"], package["version"], filenames))
+    return packages
 
 
-def _locked_uv(project: Path, env: dict) -> list[tuple[str, str, list[str]]]:
-    with open(project / "uv.lock", "rb") as f:
-        lock = tomllib.load(f)
-    out = []
-    for p in lock.get("package", []):
-        if "registry" not in p.get("source", {}):
-            continue  # the project itself, or a path/git dependency
-        urls = [w["url"] for w in p.get("wheels", []) if "url" in w]
-        if "sdist" in p and "url" in p["sdist"]:
-            urls.append(p["sdist"]["url"])
-        # uv.lock puts markers on dependency edges, not on packages, so a package that
-        # only another platform installs is still listed here.
-        out.append((p["name"], p["version"], [u.rsplit("/", 1)[-1] for u in urls]))
-    return out
+def _locked_uv_registry_packages(lock_path: Path) -> list[tuple[str, str, list[str]]]:
+    with lock_path.open("rb") as lock_file:
+        lock = tomllib.load(lock_file)
+    packages = []
+    for package in lock.get("package", []):
+        if "registry" not in package.get("source", {}):
+            continue
+        urls = [wheel["url"] for wheel in package.get("wheels", []) if "url" in wheel]
+        source_distribution = package.get("sdist", {})
+        if "url" in source_distribution:
+            urls.append(source_distribution["url"])
+        filenames = [url.rsplit("/", 1)[-1] for url in urls]
+        packages.append((package["name"], package["version"], filenames))
+    return packages
 
 
 def _pypi_latest(name: str) -> tuple[str, list[str]] | None:
     url = f"https://pypi.org/pypi/{name}/json"
     try:
-        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT) as r:
-            data = json.load(r)
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECONDS) as response:
+            release = json.load(response)
     except (OSError, ValueError):
         return None
-    return data["info"]["version"], [u["filename"] for u in data.get("urls", [])]
+    return release["info"]["version"], [distribution["filename"] for distribution in release.get("urls", [])]
 
 
 def find_gaps(project: Path, tool: str, target: str) -> list[Gap]:
-    """Locked packages that ship wheels, but none the target can install.
-
-    A package with no wheels at all is left out: that is almost always pure Python,
-    which builds anywhere, and no later release would change it.
-    """
-    lock = project / ("uv.lock" if tool == "uv" else "poetry.lock")
-    if not lock.exists():
+    lock_path = project / ("uv.lock" if tool == "uv" else "poetry.lock")
+    if not lock_path.exists():
         return []
-    env = marker_env(target)
-    cp, plat = target_tags(target)
-    locked = _locked_uv(project, env) if tool == "uv" else _locked_poetry(project, env)
+    python_tag, platform_tag = target_tags(target)
+    if tool == "uv":
+        locked_packages = _locked_uv_registry_packages(lock_path)
+    else:
+        locked_packages = _locked_poetry_registry_packages(lock_path, marker_env(target))
 
     gaps = []
-    for name, version, files in locked:
-        wheels = [f for f in files if f.endswith(".whl")]
-        if not wheels or any(wheel_fits(w, cp, plat) for w in wheels):
+    for name, locked_version, filenames in locked_packages:
+        locked_wheels = [filename for filename in filenames if filename.endswith(".whl")]
+        if not locked_wheels or any(wheel_fits(wheel, python_tag, platform_tag) for wheel in locked_wheels):
             continue
-        latest = _pypi_latest(name)
-        if latest is None:
-            gaps.append(Gap(name, version, None))
+        latest_release = _pypi_latest(name)
+        if latest_release is None:
+            gaps.append(Gap(name, locked_version, latest=None))
             continue
-        latest_version, latest_files = latest
-        fits = any(wheel_fits(f, cp, plat) for f in latest_files if f.endswith(".whl"))
-        gaps.append(Gap(name, version, latest_version, fits))
+        latest_version, latest_filenames = latest_release
+        latest_has_compatible_wheel = any(
+            wheel_fits(filename, python_tag, platform_tag)
+            for filename in latest_filenames
+            if filename.endswith(".whl")
+        )
+        gaps.append(Gap(name, locked_version, latest_version, latest_fits=latest_has_compatible_wheel))
     return gaps
